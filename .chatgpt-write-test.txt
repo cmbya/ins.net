@@ -1,2 +1,0 @@
-GitHub connector write test.
-Created by ChatGPT to verify repository write access.
