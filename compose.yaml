@@ -1,0 +1,13 @@
+services:
+  insnet:
+    build: .
+    container_name: insnet
+    restart: unless-stopped
+    ports:
+      - "18080:18080"
+    environment:
+      INS_PASSWORD: ${INS_PASSWORD:?在 .env 中设置至少 12 位的管理密码}
+      INS_INTERVAL_HOURS: ${INS_INTERVAL_HOURS:-6}
+      INS_MAX_POSTS: ${INS_MAX_POSTS:-30}
+    volumes:
+      - ./data:/data
