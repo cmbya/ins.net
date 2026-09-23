@@ -6,6 +6,7 @@ services:
       context: "https://github.com/cmbya/ins.net.git#main"
     container_name: insnet
     restart: unless-stopped
+    network_mode: bridge
     ports:
       - "18080:18080"
     environment:
