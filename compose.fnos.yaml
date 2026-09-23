@@ -1,0 +1,19 @@
+# 飞牛桌面：Docker → Compose → 新增项目 → 创建 YAML，粘贴本文件。
+# 部署前把 INS_PASSWORD 改成至少 12 位的独立密码。
+services:
+  insnet:
+    build:
+      context: "https://github.com/cmbya/ins.net.git#main"
+    container_name: insnet
+    restart: unless-stopped
+    ports:
+      - "18080:18080"
+    environment:
+      INS_PASSWORD: "请在这里改成至少12位的独立密码"
+      INS_INTERVAL_HOURS: "6"
+      INS_MAX_POSTS: "30"
+    volumes:
+      - insnet-data:/data
+
+volumes:
+  insnet-data:
