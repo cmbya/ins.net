@@ -1,138 +1,330 @@
+import errno
+import json
+import os
+import sqlite3
 import tempfile
 import unittest
-import sys
-import types
-import errno
-import os
-from types import SimpleNamespace
 from pathlib import Path
+from types import SimpleNamespace
 from unittest.mock import patch
 
 from insnet.db import Database
-from insnet.engine import GalleryDL, GalleryError, following_from_messages, normalize_messages, redact_output
+from insnet.engine import GalleryDL, GalleryError, normalize_messages, redact_output
 from insnet.sync import Coordinator, SyncService
 from insnet.web import valid_cookie_file
 
 
+def post(code, username="creator", date="2026-09-01", media_count=1):
+    return {
+        "shortcode": code,
+        "username": username,
+        "caption": "caption " + code,
+        "published_at": date,
+        "source_url": f"https://www.instagram.com/p/{code}/",
+        "display_name": "Display " + username,
+        "avatar_url": "https://cdn.example/avatar.jpg",
+        "profile_id": "1234",
+        "items": [
+            {"media_id": f"{code}-{index}", "position": index,
+             "kind": "image", "extension": "jpg"}
+            for index in range(1, media_count + 1)
+        ],
+    }
+
+
 MESSAGES = [
-    [2, {"post_shortcode": "ABC123", "username": "creator", "post_date": "2026-09-01", "description": "a carousel"}],
+    [2, {"post_shortcode": "ABC123", "username": "creator", "post_date": "2026-09-01",
+         "description": "a carousel", "user": {"username": "creator", "full_name": "Creator Name",
+         "profile_pic_url": "https://cdn.example/avatar.jpg", "pk": "1234"}}],
     [3, "https://cdn.example/a.jpg", {"media_id": "101", "extension": "jpg"}],
     [3, "https://cdn.example/b.mp4", {"media_id": "102", "extension": "mp4"}],
 ]
 
 
 class FakeGallery:
-    def __init__(self):
+    def __init__(self, posts=None):
         self.calls = 0
-        self.partial = True
+        self.partial = False
+        self.posts_data = posts or [post("ABC123", media_count=2)]
         self.post_requests = []
+        self.scan_requests = []
+        self.history_responses = {}
 
     def posts(self, cookie, url, max_posts):
         self.post_requests.append((url, max_posts))
-        return normalize_messages(MESSAGES)
+        items = list(self.posts_data)
+        return items if max_posts is None else items[:max_posts]
 
-    def download(self, cookie, post, staging):
+    def scan_posts(self, cookie, url, max_posts=None, cursor=None):
+        self.scan_requests.append((url, max_posts, cursor))
+        if max_posts == 20:
+            return list(self.posts_data[:20]), None
+        return self.history_responses.get(cursor, ([], None))
+
+    def download(self, cookie, item, staging):
         self.calls += 1
         path = Path(staging)
-        (path / "101.jpg").write_bytes(b"image")
-        if not self.partial:
-            (path / "102.mp4").write_bytes(b"video")
+        for media in item["items"]:
+            if self.partial and media["position"] > 1:
+                continue
+            (path / f"{media['media_id']}.jpg").write_bytes(b"image:" + media["media_id"].encode())
         return {p.stem: p for p in path.iterdir()}
 
 
 class ArchiveTests(unittest.TestCase):
-    def test_gallery_messages_keep_carousel_and_following(self):
+    def setup_service(self, root, fake=None):
+        (root / "tmp").mkdir(exist_ok=True)
+        archive = root / "archive"
+        archive.mkdir(exist_ok=True)
+        db = Database(root)
+        account_id = db.add_account("owner", root / "cookies.txt")
+        return db, db.account(account_id), fake or FakeGallery(), archive
+
+    def test_gallery_messages_keep_carousel_and_creator_profile(self):
         posts = normalize_messages(MESSAGES)
         self.assertEqual([x["kind"] for x in posts[0]["items"]], ["image", "video"])
         self.assertEqual(posts[0]["shortcode"], "ABC123")
-        self.assertEqual(following_from_messages([
-            [6, "https://www.instagram.com/Author/", {}],
-            [6, "https://www.instagram.com/another/", {}],
-            [6, "https://evil.example.com/wrong/", {}],
-        ]), ["another", "author"])
+        self.assertEqual(posts[0]["display_name"], "Creator Name")
+        self.assertEqual(posts[0]["avatar_url"], "https://cdn.example/avatar.jpg")
+        self.assertEqual(posts[0]["profile_id"], "1234")
+        self.assertIn("/p/", posts[0]["source_url"])
 
-    def test_partial_download_retries_and_preserves_sources(self):
+    def test_scan_posts_extracts_gallery_dl_cursor_and_profile(self):
+        gallery = GalleryDL()
+        stderr = "[instagram][debug] Cursor: QVFDLTIwMjY="
+        with patch.object(gallery, "_run", return_value=(json.dumps(MESSAGES), stderr)) as fetch:
+            items, cursor = gallery.scan_posts("cookies.txt", "https://www.instagram.com/creator/posts/",
+                                               max_posts=31, cursor="old")
+        self.assertEqual(cursor, "QVFDLTIwMjY=")
+        self.assertEqual(items[0]["display_name"], "Creator Name")
+        args, kwargs = fetch.call_args
+        self.assertEqual(args[0], "cookies.txt")
+        self.assertEqual(args[1][-1], "https://www.instagram.com/creator/posts/")
+        self.assertIn("-j", args[1])
+        self.assertIn("--verbose", args[1])
+        self.assertIn("extractor.instagram.max-posts=31", args[1])
+        self.assertIn("extractor.instagram.cursor=old", args[1])
+        self.assertTrue(kwargs["with_stderr"])
+
+    def test_regular_posts_unpacks_json_messages(self):
+        gallery = GalleryDL()
+        with patch.object(gallery, "_run", return_value=(json.dumps(MESSAGES), "")):
+            items = gallery.posts("cookies.txt", "https://www.instagram.com/owner/saved/")
+        self.assertEqual(len(items), 1)
+        self.assertEqual(items[0]["shortcode"], "ABC123")
+
+    def test_partial_download_retries_and_dedupes_saved_source(self):
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
-            db = Database(root)
-            (root / "tmp").mkdir()
-            account_id = db.add_account("owner", root / "cookies.txt")
-            account = db.account(account_id)
             fake = FakeGallery()
-            service = SyncService(db, root, fake, archive_root=root / "archive")
-            (root / "archive").mkdir()
+            fake.partial = True
+            db, account, fake, archive = self.setup_service(root, fake)
+            service = SyncService(db, root, fake, archive_root=archive)
             counts, error = service.run(account, "saved")
             self.assertEqual(counts["failed"], 1)
-            posts = db.posts(account_id)
-            first = posts[0]["media"][0]["relative_path"]
-            self.assertEqual(posts[0]["status"], "partial")
+            self.assertEqual(db.posts(account["id"])[0]["status"], "partial")
+            db.add_creator(account["id"], "creator")
             fake.partial = False
-            db.upsert_creator(account_id, "creator", enabled=True)
-            counts, error = service.run(account, "creators")
+            counts, error = service.run(account, "creator", username="creator")
             self.assertEqual(counts["downloaded"], 1)
-            posts = db.posts(account_id)
-            self.assertEqual(posts[0]["status"], "complete")
-            self.assertEqual(posts[0]["sources"], ["creator:creator:posts", "creator:creator:reels", "saved"])
-            self.assertEqual(posts[0]["media"][0]["relative_path"], first)
-            self.assertTrue(all((root / "archive" / x["relative_path"]).exists() for x in posts[0]["media"]))
+            saved = db.posts(account["id"])[0]
+            self.assertEqual(saved["status"], "complete")
+            self.assertEqual(saved["sources"], ["creator:creator:posts", "saved"])
+            self.assertTrue(all((archive / item["relative_path"]).is_file() for item in saved["media"]))
+            self.assertEqual(fake.calls, 2)
+            self.assertTrue(all("/reels/" not in url for url, _, _ in fake.scan_requests))
             counts, error = service.run(account, "saved")
             self.assertEqual(counts["skipped"], 1)
             self.assertEqual(fake.calls, 2)
 
+    def test_creator_download_cap_is_per_cycle_and_completed_posts_are_skipped(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            items = [post(f"P{i}", date=f"2026-09-{i:02d}") for i in range(1, 5)]
+            db, account, fake, archive = self.setup_service(root, FakeGallery(items))
+            db.add_creator(account["id"], "creator")
+            db.set_creator(account["id"], "creator", max_per_run=2)
+            service = SyncService(db, root, fake, archive_root=archive)
+            first, _ = service.run(account, "creator", username="creator")
+            self.assertEqual(first["downloaded"], 2)
+            self.assertEqual(len(db.posts(account["id"])), 4)
+            second, _ = service.run(account, "creator", username="creator")
+            self.assertEqual(second["downloaded"], 2)
+            self.assertEqual(second["skipped"], 2)
+            self.assertEqual(fake.calls, 4)
+            self.assertEqual(sum(item["status"] == "complete" for item in db.posts(account["id"])), 4)
+
+    def test_scanned_post_with_a_missing_media_file_is_repaired(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            db, account, fake, archive = self.setup_service(root)
+            db.add_creator(account["id"], "creator")
+            service = SyncService(db, root, fake, archive_root=archive)
+            initial, _ = service.run(account, "creator", username="creator")
+            self.assertEqual(initial["downloaded"], 1)
+            records = db.posts(account["id"])[0]
+            missing = archive / records["media"][0]["relative_path"]
+            missing.unlink()
+            repaired, _ = service.run(account, "creator", username="creator")
+            self.assertEqual(repaired["downloaded"], 1)
+            self.assertTrue(missing.is_file())
+            self.assertEqual(fake.calls, 2)
+
+    def test_all_history_cursor_advances_in_bounded_batches(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            head = [post("NEW1", date="2026-09-20")]
+            fake = FakeGallery(head)
+            fake.history_responses[None] = ([post("OLD1", date="2024-01-01")], "cursor-B")
+            fake.history_responses["cursor-B"] = ([post("OLD2", date="2023-01-01")], None)
+            db, account, fake, archive = self.setup_service(root, fake)
+            db.add_creator(account["id"], "creator")
+            db.set_creator(account["id"], "creator", sync_mode="all", max_per_run=1)
+            service = SyncService(db, root, fake, archive_root=archive)
+            first, _ = service.run(account, "creator", username="creator")
+            self.assertEqual(first["downloaded"], 1)
+            self.assertEqual(db.creator(account["id"], "creator")["scan_cursor"], "cursor-B")
+            second, _ = service.run(account, "creator", username="creator")
+            creator = db.creator(account["id"], "creator")
+            self.assertEqual(creator["scan_cursor"], None)
+            self.assertEqual(creator["history_complete"], 1)
+            history_requests = [(size, cursor) for _, size, cursor in fake.scan_requests if size == 31]
+            self.assertEqual(history_requests, [(31, None), (31, "cursor-B")])
+            self.assertEqual(len(db.posts(account["id"])), 3)
+            self.assertLessEqual(first["downloaded"] + second["downloaded"], 2)
+            self.assertTrue(any(item["status"] == "pending" for item in db.posts(account["id"])))
+
+    def test_only_manual_creator_is_scheduled_and_post_feed_has_no_reels(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            db, account, fake, archive = self.setup_service(root)
+            db.add_creator(account["id"], "selected")
+            db.add_creator(account["id"], "paused")
+            db.set_creator(account["id"], "selected", enabled=False)
+            db.set_creator(account["id"], "paused", enabled=False)
+            due = db.due_creators(account["id"])
+            self.assertIsNone(due)
+            db.set_creator(account["id"], "selected", enabled=True)
+            due = db.due_creators(account["id"])
+            self.assertEqual(due["username"], "selected")
+            fake.posts_data = [post("SEL", username="selected")]
+            service = SyncService(db, root, fake, archive_root=archive)
+            service.run(account, "creator", username="selected")
+            self.assertEqual(len(fake.scan_requests), 1)
+            self.assertTrue(fake.scan_requests[0][0].endswith("/selected/posts/"))
+            self.assertFalse(any("reels" in item[0] for item in fake.scan_requests))
+
     def test_archive_copies_across_mounts_before_atomic_replace(self):
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
-            (root / "tmp").mkdir()
-            archive = root / "archive"
-            archive.mkdir()
-            db = Database(root)
-            account_id = db.add_account("owner", root / "cookies.txt")
-            account = db.account(account_id)
-            fake = FakeGallery()
-            fake.partial = False
+            db, account, fake, archive = self.setup_service(root)
             service = SyncService(db, root, fake, archive_root=archive)
             real_replace = os.replace
-
             def fail_on_cross_mount(src, dst):
                 if Path(src).parent.resolve() != Path(dst).parent.resolve():
                     raise OSError(errno.EXDEV, "Invalid cross-device link")
                 return real_replace(src, dst)
-
             with patch("insnet.sync.os.replace", side_effect=fail_on_cross_mount):
                 counts, error = service.run(account, "saved")
-
             self.assertEqual(counts["downloaded"], 1)
             self.assertEqual(counts["failed"], 0)
             self.assertEqual(error, "")
-            media = db.posts(account_id)[0]["media"]
+            media = db.posts(account["id"])[0]["media"]
             self.assertTrue(all((archive / row["relative_path"]).is_file() for row in media))
 
-    def test_only_selected_creators_are_scanned_latest_20_or_all(self):
+    def test_creator_deletion_can_preserve_or_remove_archive_and_shared_posts(self):
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
-            (root / "tmp").mkdir()
-            (root / "archive").mkdir()
-            db = Database(root)
-            account_id = db.add_account("owner", root / "cookies.txt")
-            account = db.account(account_id)
-            db.upsert_creator(account_id, "selected", enabled=True)
-            db.upsert_creator(account_id, "not_selected", enabled=False)
-            fake = FakeGallery()
-            service = SyncService(db, root, fake, archive_root=root / "archive")
-            service.run(account, "creators")
-            self.assertEqual(len(fake.post_requests), 2)
-            self.assertTrue(all("selected" in url and "not_selected" not in url for url, _ in fake.post_requests))
-            self.assertTrue(all(limit == 20 for _, limit in fake.post_requests))
-            db.set_creator(account_id, "selected", full_sync=True)
-            service.run(account, "creators")
-            self.assertEqual([limit for _, limit in fake.post_requests[-2:]], [None, None])
+            db, account, _, _ = self.setup_service(root)
+            account_id = account["id"]
+            db.add_creator(account_id, "alice")
+            db.add_creator(account_id, "bob")
+            exclusive = post("ONLY")
+            legacy_reel = post("OLDREEL")
+            shared_saved = post("SAVED")
+            shared_creator = post("SHARED", username="alice")
+            ids = {}
+            for data, sources, path in [
+                (exclusive, ["creator:alice:posts"], "alice/only.jpg"),
+                (legacy_reel, ["creator:alice:reels"], "alice/old-reel.jpg"),
+                (shared_saved, ["creator:alice:posts", "saved"], "alice/saved.jpg"),
+                (shared_creator, ["creator:alice:posts", "creator:bob:posts"], "alice/shared.jpg"),
+            ]:
+                for source in sources:
+                    post_id = db.upsert_post(account_id, data, source)
+                ids[data["shortcode"]] = post_id
+                db.set_media_file(post_id, data["items"][0]["media_id"], path, 5, "jpg")
+                db.set_post_status(post_id, "complete")
+            result = db.delete_creator(account_id, "alice", delete_archive=True)
+            self.assertEqual(result["removed_posts"], 2)
+            self.assertEqual(result["shared_posts"], 2)
+            self.assertEqual(set(result["files"]), {"alice/only.jpg", "alice/old-reel.jpg"})
+            self.assertIsNone(db.post(ids["ONLY"]))
+            self.assertIsNone(db.post(ids["OLDREEL"]))
+            self.assertEqual(db.post(ids["SAVED"])["shortcode"], "SAVED")
+            self.assertEqual(db.post(ids["SHARED"])["shortcode"], "SHARED")
+            self.assertIsNone(db.creator(account_id, "alice"))
+            self.assertIsNotNone(db.creator(account_id, "bob"))
+
+    def test_removing_creator_from_list_keeps_posts_and_file_relations(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            db, account, _, _ = self.setup_service(root)
+            db.add_creator(account["id"], "creator")
+            data = post("KEEP")
+            post_id = db.upsert_post(account["id"], data, "creator:creator:posts")
+            result = db.delete_creator(account["id"], "creator", delete_archive=False)
+            self.assertEqual(result["files"], [])
+            self.assertEqual(result["removed_posts"], 0)
+            self.assertIsNotNone(db.post(post_id))
+            self.assertEqual(db.posts(account["id"])[0]["sources"], ["creator:creator:posts"])
+            db.add_creator(account["id"], "creator")
+            self.assertEqual(db.creators(account["id"])[0]["username"], "creator")
+
+    def test_old_database_migrates_once_and_clears_imported_creators(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            path = Path(temporary) / "insnet.sqlite3"
+            conn = sqlite3.connect(path)
+            conn.executescript("""
+                CREATE TABLE accounts(id TEXT PRIMARY KEY, username TEXT NOT NULL UNIQUE,
+                    cookie_path TEXT NOT NULL, created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP);
+                CREATE TABLE creators(account_id TEXT NOT NULL, username TEXT NOT NULL,
+                    enabled INTEGER NOT NULL DEFAULT 1, full_sync INTEGER NOT NULL DEFAULT 0,
+                    manual INTEGER NOT NULL DEFAULT 1, last_sync TEXT,
+                    PRIMARY KEY(account_id,username));
+                INSERT INTO accounts(id,username,cookie_path) VALUES('a','owner','cookies.txt');
+                INSERT INTO creators(account_id,username,enabled,full_sync,manual)
+                    VALUES('a','keep',1,1,1),('a','imported',1,0,0);
+            """)
+            conn.commit(); conn.close()
+            db = Database(temporary)
+            self.assertEqual(db.creator("a", "keep")["sync_mode"], "all")
+            self.assertIsNone(db.creator("a", "imported"))
+            db.set_creator("a", "keep", sync_mode="recent20")
+            reopened = Database(temporary)
+            self.assertEqual(reopened.creator("a", "keep")["sync_mode"], "recent20")
+
+    def test_429_backoff_and_per_creator_schedule(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            db = Database(temporary)
+            account_id = db.add_account("owner", Path(temporary) / "cookies.txt")
+            db.add_creator(account_id, "creator")
+            db.set_creator(account_id, "creator", interval_minutes=30)
+            db.mark_creator_sync(account_id, "creator", "HTTP 429", rate_limited=True)
+            creator = db.creator(account_id, "creator")
+            self.assertEqual(creator["failures"], 1)
+            self.assertEqual(creator["last_error"], "HTTP 429")
+            self.assertFalse(db.due_creators(account_id))
+            db.set_saved_schedule(account_id, True, 90)
+            db.mark_saved_sync(account_id)
+            self.assertEqual(db.account(account_id)["saved_interval_minutes"], 90)
 
     def test_failure_log_contains_diagnostics_and_redacts_cookie(self):
         with tempfile.TemporaryDirectory() as temporary:
             cookie = Path(temporary) / "cookies.txt"
             cookie.write_text(".instagram.com\tTRUE\t/\tTRUE\t0\tsessionid\tsuper_secret_token\n")
             with patch("insnet.engine.subprocess.run", return_value=SimpleNamespace(
-                returncode=1, stderr="HTTP 401 super_secret_token", stdout="")):
+                    returncode=1, stderr="HTTP 401 super_secret_token", stdout="")):
                 with self.assertRaises(GalleryError) as caught:
                     GalleryDL()._run(cookie, ["https://www.instagram.com/"])
             self.assertIn("HTTP 401", str(caught.exception))
@@ -141,140 +333,27 @@ class ArchiveTests(unittest.TestCase):
     def test_redaction_preserves_urls_when_cookie_values_are_short(self):
         with tempfile.TemporaryDirectory() as temporary:
             cookie = Path(temporary) / "cookies.txt"
-            cookie.write_text(
-                ".instagram.com\tTRUE\t/\tTRUE\t0\tlocale\ten\n"
-                ".instagram.com\tTRUE\t/\tTRUE\t0\tds_user_id\t123456789\n"
-            )
+            cookie.write_text(".instagram.com\tTRUE\t/\tTRUE\t0\tlocale\ten\n"
+                              ".instagram.com\tTRUE\t/\tTRUE\t0\tds_user_id\t123456789\n")
             message = "https://www.instagram.com/api/v1/users/web_profile_info/?username=666&locale=en 123456789"
             cleaned = redact_output(message, cookie)
             self.assertIn("/api/v1/users/web_profile_info/?username=666", cleaned)
             self.assertIn("en", cleaned)
             self.assertNotIn("123456789", cleaned)
 
-    def test_following_import_uses_logged_in_profile_api(self):
-        with tempfile.TemporaryDirectory() as temporary:
-            cookie = Path(temporary) / "cookies.txt"
-            cookie.write_text(
-                "# Netscape HTTP Cookie File\n"
-                ".instagram.com\tTRUE\t/\tTRUE\t0\tsessionid\tsession-secret\n"
-                ".instagram.com\tTRUE\t/\tTRUE\t0\tcsrftoken\tcsrf-secret\n"
-            )
-            loaded = {}
-
-            class FakeLoader:
-                def __init__(self, **kwargs):
-                    self.context = SimpleNamespace(load_session=lambda username, values:
-                                                   loaded.update(username=username, cookies=values))
-
-                def close(self):
-                    pass
-
-            class FakeProfile:
-                @staticmethod
-                def own_profile(context):
-                    return SimpleNamespace(get_followees=lambda: iter([
-                        SimpleNamespace(username="Zed"), SimpleNamespace(username="alice")]),
-                        username="owner")
-
-                @staticmethod
-                def from_username(context, username):
-                    raise AssertionError("from_username would call the rate-limited endpoint")
-
-            fake_module = types.ModuleType("instaloader")
-            fake_module.Instaloader = FakeLoader
-            fake_module.Profile = FakeProfile
-            progress = []
-            with patch.dict(sys.modules, {"instaloader": fake_module}):
-                names = GalleryDL().following(cookie, "owner", progress.append)
-            self.assertEqual(names, ["alice", "zed"])
-            self.assertEqual(loaded["username"], "owner")
-            self.assertEqual(loaded["cookies"]["sessionid"], "session-secret")
-            self.assertEqual(progress, [2])
-
-    def test_following_rate_limit_gives_retry_guidance(self):
-        with tempfile.TemporaryDirectory() as temporary:
-            cookie = Path(temporary) / "cookies.txt"
-            cookie.write_text(
-                ".instagram.com\tTRUE\t/\tTRUE\t0\tsessionid\tsession-secret\n"
-                ".instagram.com\tTRUE\t/\tTRUE\t0\tcsrftoken\tcsrf-secret\n"
-            )
-
-            class FakeLoader:
-                def __init__(self, **kwargs):
-                    self.context = SimpleNamespace(load_session=lambda username, values: None)
-
-                def close(self):
-                    pass
-
-            class FakeProfile:
-                @staticmethod
-                def own_profile(context):
-                    raise RuntimeError("429 Too Many Requests")
-
-            fake_module = types.ModuleType("instaloader")
-            fake_module.Instaloader = FakeLoader
-            fake_module.Profile = FakeProfile
-            with patch.dict(sys.modules, {"instaloader": fake_module}):
-                with self.assertRaises(GalleryError) as caught:
-                    GalleryDL().following(cookie, "owner")
-
-            self.assertIn("等待 15–30 分钟", str(caught.exception))
-            self.assertIn("429 Too Many Requests", str(caught.exception))
-
-    def test_following_failure_is_saved_with_detail(self):
-        class BrokenGallery:
-            def following(self, cookie_path, username, progress=None):
-                raise GalleryError("HTTP 403 checkpoint_required")
-
-        with tempfile.TemporaryDirectory() as temporary:
-            root = Path(temporary)
-            db = Database(root)
-            account_id = db.add_account("owner", root / "cookies.txt")
-            service = SyncService(db, root, BrokenGallery(), archive_root=root / "archive")
-            coordinator = Coordinator(db, service)
-            run_id = db.create_run(account_id, "following")
-            coordinator._execute(run_id, db.account(account_id), "following")
-            run = db.runs()[0]
-            self.assertEqual(run["status"], "failed")
-            self.assertIn("HTTP 403 checkpoint_required", run["message"])
-            self.assertIn("HTTP 403 checkpoint_required", db.run_logs(run_id)[-1]["message"])
-
-    def test_legacy_media_is_copied_to_archive_mount(self):
-        with tempfile.TemporaryDirectory() as temporary:
-            root = Path(temporary)
-            old_file = root / "media" / "owner" / "creator" / "post.jpg"
-            old_file.parent.mkdir(parents=True)
-            old_file.write_bytes(b"legacy image")
-            archive = root / "archive"
-            archive.mkdir()
-            db = Database(root)
-            account_id = db.add_account("owner", root / "cookies.txt")
-            post = {"shortcode": "ABC123", "username": "creator", "caption": "",
-                    "published_at": "2026-09-01", "source_url": "https://www.instagram.com/p/ABC123/",
-                    "items": [{"media_id": "101", "position": 1, "kind": "image", "extension": "jpg"}]}
-            post_id = db.upsert_post(account_id, post, "saved")
-            db.set_media_file(post_id, "101", "owner/creator/post.jpg", old_file.stat().st_size, "jpg")
-            service = SyncService(db, root, archive_root=archive)
-            service._restore_legacy_media(post_id, db.post_media(post_id)[0])
-            row = db.post_media(post_id)[0]
-            self.assertEqual(row["relative_path"], "Instagram/owner/creator/post.jpg")
-            self.assertEqual((archive / row["relative_path"]).read_bytes(), b"legacy image")
-            self.assertTrue(old_file.exists())
-
     def test_run_logs_are_persisted_in_order(self):
         with tempfile.TemporaryDirectory() as temporary:
             db = Database(temporary)
             account_id = db.add_account("owner", Path(temporary) / "cookies.txt")
-            run_id = db.create_run(account_id, "following")
-            db.add_run_log(run_id, "info", "following", "start")
-            db.add_run_log(run_id, "error", "following", "HTTP 401")
+            run_id = db.create_run(account_id, "creator:@author")
+            db.add_run_log(run_id, "info", "creator:author:posts", "start")
+            db.add_run_log(run_id, "error", "creator:author:posts", "HTTP 401")
             self.assertEqual([line["message"] for line in db.run_logs(run_id)], ["start", "HTTP 401"])
             self.assertEqual(db.runs()[0]["log_count"], 2)
 
     def test_cookie_requires_instagram_session(self):
-        self.assertTrue(valid_cookie_file(
-            ".instagram.com\tTRUE\t/\tTRUE\t0\tsessionid\tsecret\n"
-            ".instagram.com\tTRUE\t/\tTRUE\t0\tcsrftoken\tcsrf\n"))
+        self.assertTrue(valid_cookie_file(".instagram.com\tTRUE\t/\tTRUE\t0\tsessionid\tsecret\n"
+                                          ".instagram.com\tTRUE\t/\tTRUE\t0\tcsrftoken\tcsrf\n"))
         self.assertFalse(valid_cookie_file(".instagram.com\tTRUE\t/\tTRUE\t0\tsessionid\tsecret\n"))
         self.assertFalse(valid_cookie_file("evil.com\tTRUE\t/\tTRUE\t0\tsessionid\tsecret\n"))
 

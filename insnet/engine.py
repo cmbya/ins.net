@@ -4,10 +4,8 @@ import hashlib
 import json
 import re
 import subprocess
-from contextlib import suppress
 from collections import OrderedDict
 from pathlib import Path
-from urllib.parse import urlparse
 
 
 USERNAME = re.compile(r"^[A-Za-z0-9._]{1,30}$")
@@ -67,6 +65,12 @@ def normalize_messages(messages):
         kind = "video" if extension in ("mp4", "mov", "webm", "mkv") else "image"
         if shortcode not in groups:
             date = meta.get("post_date") or meta.get("date") or ""
+            user_meta = directory.get("user") if isinstance(directory.get("user"), dict) else directory
+            display_name = str(user_meta.get("full_name") or user_meta.get("fullname") or
+                               meta.get("full_name") or meta.get("fullname") or "")[:160]
+            avatar_url = str(user_meta.get("profile_pic_url_hd") or user_meta.get("profile_pic_url") or
+                             user_meta.get("avatar_url") or meta.get("profile_pic_url") or "")[:2000]
+            profile_id = str(user_meta.get("id") or user_meta.get("pk") or meta.get("owner_id") or "")[:80]
             groups[shortcode] = {
                 "shortcode": shortcode, "username": username,
                 "caption": str(meta.get("description") or meta.get("post_caption") or "")[:5000],
@@ -74,6 +78,7 @@ def normalize_messages(messages):
                 "source_url": (meta.get("post_url") if str(meta.get("post_url", "")).startswith(
                     ("https://www.instagram.com/p/", "https://www.instagram.com/reel/"))
                     else f"https://www.instagram.com/p/{shortcode}/"),
+                "display_name": display_name, "avatar_url": avatar_url, "profile_id": profile_id,
                 "items": [],
             }
         group = groups[shortcode]
@@ -86,23 +91,11 @@ def normalize_messages(messages):
     return list(groups.values())
 
 
-def following_from_messages(messages):
-    names = set()
-    for msg in messages:
-        if not isinstance(msg, list) or len(msg) < 2 or msg[0] != 6:
-            continue
-        url = str(msg[1])
-        path = urlparse(url).path.strip("/").split("/")
-        if urlparse(url).hostname in ("instagram.com", "www.instagram.com") and len(path) == 1 and USERNAME.fullmatch(path[0]):
-            names.add(path[0].lower())
-    return sorted(names)
-
-
 class GalleryDL:
     def __init__(self, executable="gallery-dl", timeout=1800):
         self.executable, self.timeout = executable, timeout
 
-    def _run(self, cookie_path, args):
+    def _run(self, cookie_path, args, with_stderr=False):
         command = [self.executable, "--config-ignore", "--no-input", "--cookies",
                    str(cookie_path), *args]
         try:
@@ -116,13 +109,17 @@ class GalleryDL:
         if result.returncode:
             detail = redact_output((result.stderr, result.stdout), cookie_path)
             raise GalleryError(f"gallery-dl 退出码 {result.returncode}。\n{detail or '程序未输出错误详情。'}")
-        return result.stdout
+        return (result.stdout, result.stderr) if with_stderr else result.stdout
 
-    def _json(self, cookie_path, url, max_posts=None):
+    def _json(self, cookie_path, url, max_posts=None, cursor=None, verbose=False):
         args = ["-j"]
         if max_posts is not None:
             args += ["-o", f"extractor.instagram.max-posts={int(max_posts)}"]
-        raw = self._run(cookie_path, [*args, url])
+        if cursor:
+            args += ["-o", f"extractor.instagram.cursor={cursor}"]
+        if verbose:
+            args.append("--verbose")
+        raw, stderr = self._run(cookie_path, [*args, url], with_stderr=True)
         try:
             messages = json.loads(raw)
         except (ValueError, TypeError) as exc:
@@ -133,66 +130,18 @@ class GalleryDL:
         if errors:
             details = "\n".join(str(item.get("message") or item) for item in errors if isinstance(item, dict))
             raise GalleryError("gallery-dl 提取失败。\n" + redact_output(details or errors, cookie_path))
-        return messages
-
-    def following(self, cookie_path, username, progress=None):
-        """Read the logged-in account's followees through Instaloader's authenticated API."""
-        loader = None
-        try:
-            import instaloader
-
-            cookies = {}
-            for line in Path(cookie_path).read_text(encoding="utf-8", errors="replace").splitlines():
-                line = line.removeprefix("#HttpOnly_")
-                if not line or line.lstrip().startswith("#"):
-                    continue
-                fields = line.split("\t")
-                if len(fields) >= 7 and fields[0].lstrip(".").lower() == "instagram.com" and fields[6]:
-                    cookies[fields[5]] = fields[6]
-            if not cookies.get("sessionid") or not cookies.get("csrftoken"):
-                raise GalleryError("Cookie 文件缺少 instagram.com 的 sessionid 或 csrftoken，请重新导出 Cookie。")
-
-            loader = instaloader.Instaloader(quiet=True, sleep=True, max_connection_attempts=1)
-            loader.context.load_session(username, cookies)
-            # from_username() requests web_profile_info, which Instagram may throttle
-            # with HTTP 429 even when the authenticated session is valid. own_profile()
-            # uses the authenticated GraphQL session and avoids that endpoint.
-            profile = instaloader.Profile.own_profile(loader.context)
-            profile_username = str(profile.username).strip().lower()
-            if profile_username != username.strip().lower():
-                raise GalleryError(
-                    f"Cookie 当前登录的是 @{profile_username}，与配置账号 @{username} 不一致；请更新该账号的 Cookie。"
-                )
-            names = []
-            for followee in profile.get_followees():
-                name = str(followee.username).strip().lower()
-                if USERNAME.fullmatch(name):
-                    names.append(name)
-                    if progress and len(names) % 50 == 0:
-                        progress(len(names))
-            if progress and names and len(names) % 50:
-                progress(len(names))
-            return sorted(set(names))
-        except GalleryError:
-            raise
-        except Exception as exc:
-            detail = redact_output(str(exc), cookie_path)
-            if re.search(r"\b429\b|too many requests", detail, re.IGNORECASE):
-                message = "Instagram 暂时限制了关注列表请求（HTTP 429）。请暂停同步，等待 15–30 分钟后再试一次；连续重试可能延长限制。"
-            else:
-                message = f"Instaloader 读取关注列表失败（{type(exc).__name__}）"
-            if detail:
-                message += f"：{detail}"
-            else:
-                message += "。请检查运行日志；若提示登录或挑战验证，请重新导出有效 Cookie。"
-            raise GalleryError(message) from exc
-        finally:
-            if loader is not None:
-                with suppress(Exception):
-                    loader.close()
+        return messages, stderr
 
     def posts(self, cookie_path, url, max_posts=None):
-        return normalize_messages(self._json(cookie_path, url, max_posts))
+        messages, _ = self._json(cookie_path, url, max_posts)
+        return normalize_messages(messages)
+
+    def scan_posts(self, cookie_path, url, max_posts=None, cursor=None):
+        """Fetch one bounded page and return gallery-dl's Instagram continuation cursor."""
+        messages, stderr = self._json(cookie_path, url, max_posts, cursor=cursor, verbose=True)
+        matches = re.findall(r"\bCursor:\s*([^\s]+)", stderr, flags=re.IGNORECASE)
+        next_cursor = matches[-1] if matches else None
+        return normalize_messages(messages), next_cursor
 
     def download(self, cookie_path, post, staging):
         staging = Path(staging)

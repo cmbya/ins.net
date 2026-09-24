@@ -8,15 +8,13 @@ services:
     restart: unless-stopped
     network_mode: bridge
     ports:
-      - "18080:18080"
+      - "18088:18080"
     environment:
       INS_PASSWORD: "请在这里改成至少12位的独立密码"
       INS_ARCHIVE_ROOT: /archive
-      INS_INTERVAL_HOURS: "6"
-      INS_MAX_POSTS: "20"
     volumes:
       - insnet-data:/data
-      - /vol2/1000/insnet/archive:/archive
+      - /vol2/1000/docker/INS/insnet:/archive
 
 volumes:
   insnet-data:

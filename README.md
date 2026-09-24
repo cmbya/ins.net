@@ -1,60 +1,59 @@
 # ins.net
 
-将 Instagram 的关注博主帖子、Reels 和自己已保存的帖子归档到本地。源项目构思参考 [dysync.net](https://github.com/jianzhichu/dysync.net)；此版本采用 Python 标准库、[gallery-dl](https://github.com/mikf/gallery-dl) 和 SQLite 重新实现。暂不支持快拍、点赞列表或 fnOS FPK 安装包。
+本地运行的 Instagram 帖子归档器。使用自己的 Instagram Cookie，手动添加需要归档的博主，保存帖子图片与视频，并可同步自己在 Instagram 收藏的帖子。
 
 ## 功能
 
-- 用 Instagram 登录 Cookie 导入关注列表，手动选择要监控的博主；也可直接添加博主。
-- 监控博主帖子和 Reels；归档账号自己保存的帖子。
-- 同一帖子只保留一份记录，同时标注“关注博主”与“已保存”等来源。
-- 轮播图片、视频逐项保留原文件，在页面内切换；视频支持播放和拖动。
-- 自动同步间隔默认 6 小时，页面可随时手动同步；只同步用户勾选的博主。每位博主默认扫描最新 20 条，也可单独设为全部历史；已保存列表扫描全部历史。
-- 运行日志记录每个来源、扫描进度、文件状态和详细错误，可在最近任务中展开查看；下载失败的媒体下一次继续补齐。
-- 可在网页设置归档子目录；NAS 实际保存根目录通过 Compose 的 `/archive` 绑定路径设置。
+- 手动维护监控博主，不读取或导入关注列表。
+- 每位博主独立设置同步范围：最新 20 条，或全部历史分批补齐。
+- 每位博主独立设置自动同步间隔（最短 30 分钟）和每轮最多下载数（1–200 条）。达到上限后，未下载项保留在本地待办中，后续接着处理。
+- 博主列表显示昵称、头像、用户名和完整归档的帖子数；Instagram 无法提供昵称或头像时显示用户名和默认头像。
+- 保留“同步已保存”以及独立自动同步间隔。
+- 同一账号按帖子短码去重。媒体文件已经完整归档时直接跳过；同步扫描到部分下载或媒体文件缺失的帖子时会补齐。
+- 删除博主时可只从监控列表移除并保留归档，或同时删除该博主独占的记录和文件。被“已保存”或其他博主共同引用的帖子会保留。
+- 任务日志显示扫描进度、已跳过/下载/失败情况和错误详情。Cookie 值会在采集器错误输出中遮盖。
+- 轮播中的图片和视频按原媒体逐项保存；帖子中的视频照常处理，不单独扫描 Reels。
+- 可设置归档根目录下的子目录。归档根目录由 Compose 映射到 `/archive` 的 NAS 文件夹决定。
 
-## 在飞牛桌面直接部署（不用 SSH）
+## 飞牛桌面 Compose 部署（不用 SSH）
 
-1. 在飞牛文件管理器创建归档文件夹，例如 `/vol2/1000/insnet/archive`。如果你的共享目录实际在 `/vol3/1000`，后面也相应改成 `/vol3/1000/insnet/archive`。
-2. 打开 **Docker → Compose → 新增项目**，项目名称填 `insnet`，选择项目配置保存位置。
-3. 选择**创建 YAML / docker-compose.yml**，粘贴 [compose.fnos.yaml](compose.fnos.yaml) 的内容。确认卷映射左边是你刚才创建的 NAS 目录；把 `INS_PASSWORD` 改成自己的至少 12 位密码。
-4. 确认主机端口 `18080` 未被占用，保存并构建、启动。在浏览器打开 `http://NAS_IP:18080` 登录。更新已有项目时选择重新构建镜像并拉取 `main` 最新代码；仅重启容器会继续使用旧镜像。不要删除 `insnet-data` 数据卷。
+1. 在飞牛文件管理器确认归档文件夹存在，例如 `/vol2/1000/docker/INS/insnet`。Compose 会把它挂载到容器的 `/archive`。
+2. 打开 **Docker → Compose → 新增项目**，选择创建 YAML，把 [compose.fnos.yaml](compose.fnos.yaml) 内容粘贴进去。
+3. 修改 `INS_PASSWORD` 为至少 12 位的独立管理密码，并确认 `/vol2/1000/insnet/archive:/archive` 左侧路径存在。
+4. 保存并构建、启动。使用飞牛自带的 `bridge` 网络，浏览器打开 `http://NAS_IP:18088`。
+5. 更新已有项目时选择重新构建镜像并拉取 `main` 最新代码。只重启容器不会更新代码。保留 `insnet-data` 卷，它保存账号 Cookie、同步配置和归档记录。
 
-这份配置使用 Docker 自带的 `bridge` 网络（`network_mode: bridge`），从公开 GitHub 仓库构建镜像；NAS 首次构建需要连接 GitHub、PyPI 和 Debian 软件源。数据库及 Cookie 保存在 Docker 命名卷 `insnet-data`；媒体保存在上面选的 NAS 目录。网页“归档位置”可以设置这个根目录下的子文件夹，例如 `Instagram/备份`。如果想更换 NAS 根目录，在 Compose 的 `/vol2/1000/insnet/archive:/archive` 左边填写新路径，再重新部署。端口占用时，把 `18080:18080` 左侧改为其他空闲端口，例如 `18081:18080`，浏览器也使用新端口。
+容器构建需要网络访问 GitHub、PyPI 和 Debian 软件源。数据库与 Cookie 放在 Docker 命名卷 `insnet-data`；媒体文件写入 NAS 绑定目录。网页中的“保存子目录”是 `/archive` 下的相对路径，例如 `Instagram/备份`。如果主机端口 18088 被占用，可将 Compose 左侧端口换成其他空闲端口，例如 `18081:18080`。
 
-## 命令行部署（其他 Linux 环境）
+## 命令行 Compose 部署
 
-需要 Docker Compose、能访问 Instagram 的网络，以及容器所在设备足够的存储空间。`gallery-dl`、`yt-dlp`、`Instaloader` 和 `ffmpeg` 在镜像里安装。
+需要 Docker Compose、可访问 Instagram 的网络和足够的归档空间。
 
 ```sh
 git clone https://github.com/cmbya/ins.net.git
 cd ins.net
 cp .env.example .env
-# 编辑 .env 的 INS_PASSWORD，至少 12 位
+# 编辑 .env 中的 INS_PASSWORD
 mkdir -p data archive
 docker compose up -d --build
 ```
 
-在浏览器打开 `http://NAS_IP:18080`。公开网络访问请通过 HTTPS 反向代理；管理密码和 Cookie 不适合通过明文 HTTP 在公网传送。数据库与 Cookie 在 `./data`，媒体在 `./archive`，迁移时备份这两个目录。端口、挂载位置可以在 `compose.yaml` 中修改。
+浏览器打开 `http://NAS_IP:18080`。通过公网访问时，请在 HTTPS 反向代理后使用；管理密码和 Cookie 属于敏感凭据。数据库/Cookie 位于 `./data`，媒体位于 `./archive`，迁移前备份这两处目录。
 
-## 添加账号并使用
+## 使用
 
-1. 从你自己的浏览器导出 Instagram 的 **Netscape cookies.txt 格式**文件，文件必须包含 `instagram.com` 域名下的 `sessionid` 和 `csrftoken`。它相当于登录凭据，请勿提交到 Git 或分享给他人。
-2. 登录 ins.net 后，添加账号用户名和 Cookie 文件。
-3. 点击“导入关注列表”，勾选想归档的博主，再点“全部同步”。也可手动添加博主；“同步已保存”不依赖导入关注列表。
-4. 在“关注博主”中勾选要同步的人；“扫描全部历史”打开时取全部帖子，关闭时仅取最新 20 条。新导入的关注默认不勾选，不会自动全部下载。
-5. 在“归档位置”设置 NAS 归档根目录下的子文件夹。实际 NAS 根目录是 Compose 映射到 `/archive` 的路径。
-6. 在最近任务中展开“查看运行日志”，查看 Instagram 返回错误、采集阶段和逐帖结果。
+1. 从自己的浏览器导出 Instagram **Netscape cookies.txt** 文件，需包含 `instagram.com` 的 `sessionid` 和 `csrftoken`。Cookie 相当于登录凭据，不要分享或提交到 Git。
+2. 登录后添加 Instagram 账号和 Cookie。
+3. 在“监控博主”输入用户名添加。列表会在成功读取到帖子信息后更新昵称、头像和归档计数；读取不到时显示用户名和默认头像。
+4. 为每个博主选择“最新 20 条”或“全部历史（分批）”，设置同步间隔和每轮下载上限，然后保存。暂停“自动同步”不会删除博主或文件，仍可手动点“立即同步”。
+5. “全部历史”会每轮读取一个有界的历史页，并保存分页游标；每轮下载上限只限制需要新下载或补齐的帖子。已完整归档的帖子只跳过，不占下载上限。遇到反复失败的媒体时，系统会把待下载帖子先处理，并降低限速错误后的重试频率。
+6. “同步已保存”可手动运行，也可在归档设置中开启自动同步并设置间隔。已经归档的帖子会跳过。
+7. 在“归档设置”设置 `/archive` 下的保存子目录。最近任务可展开运行日志查看详细情况。
 
-`INS_MAX_POSTS` 限制未选“全部历史”的博主来源（默认 20 条），`INS_INTERVAL_HOURS` 设置定时同步周期。博主“全部历史”模式每次会重新枚举整个历史列表，适合首次补档，完成后可关闭。已保存列表每次扫描全部历史，首次同步可能较慢。当 Cookie 过期、Instagram 要求验证或限制访问时，用同一用户名和新 Cookie 更新即可。请只归档你有权限查看的内容，并遵守平台条款。
-
-## 技术说明
-
-关注列表通过 Instaloader 的登录会话接口读取，帖子、Reels 和已保存列表通过 `gallery-dl` 读取；媒体先下载到暂存目录，再复制到归档目录内的临时文件并原子替换，支持 `/data` 与 `/archive` 位于不同挂载点。运行日志保存在 SQLite，可在网页读取；Cookie 值会从采集器错误输出中遮盖。记录按账号和帖子短码去重，媒体按 `media_id` 去重。程序不会把图片合成视频，也不会另外保存视频封面或音轨。
+## 开发测试
 
 ```sh
 python3 -m unittest discover -s tests -v
 ```
 
-## 来源
-
-项目思路来自 MIT 协议的 [jianzhichu/dysync.net](https://github.com/jianzhichu/dysync.net)。采集依赖 gallery-dl；视频格式可能由 yt-dlp / ffmpeg 处理。本站并非 Meta/Instagram 官方产品。
+来源项目思路参考 MIT 协议的 [jianzhichu/dysync.net](https://github.com/jianzhichu/dysync.net)。采集依赖 `gallery-dl`，视频可能由 `yt-dlp` 和 `ffmpeg` 处理。本站不是 Meta/Instagram 官方产品。请仅归档你有权限查看的内容，并遵守平台条款。

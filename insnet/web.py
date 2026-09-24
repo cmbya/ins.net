@@ -20,7 +20,7 @@ from .sync import Coordinator, SyncService
 
 
 STATIC = Path(__file__).resolve().parent.parent / "static"
-APP_VERSION = "0.3.1"
+APP_VERSION = "0.4.0"
 
 
 def valid_cookie_file(value):
@@ -116,9 +116,13 @@ class Handler(BaseHTTPRequestHandler):
             if path == "/api/settings":
                 subdir = self.server.db.setting("media_subdir", "Instagram")
                 target = self.server.archive_root / subdir if subdir else self.server.archive_root
+                account_id = query.get("account", [""])[0]
+                account = self.server.db.account(account_id) if account_id else None
                 return self.reply(200, {"media_subdir": subdir,
                                         "archive_root": str(self.server.archive_root),
-                                        "media_path": str(target)})
+                                        "media_path": str(target),
+                                        "auto_saved": bool(account["auto_saved"]) if account else True,
+                                        "saved_interval_minutes": int(account["saved_interval_minutes"]) if account else 360})
             match = re.fullmatch(r"/media/(\d+)/([A-Za-z0-9_-]+)", path)
             if match:
                 return self.serve_media(int(match[1]), match[2])
@@ -206,9 +210,23 @@ class Handler(BaseHTTPRequestHandler):
                     raise ValueError("保存目录只能填写 /archive 下的相对路径，不能包含 ..")
                 target = self.server.archive_root / subdir if subdir else self.server.archive_root
                 target.resolve().relative_to(self.server.archive_root)
+                account_id = str(value.get("account", ""))
+                auto_saved = True
+                interval = 360
+                if account_id:
+                    if not self.server.db.account(account_id):
+                        raise ValueError("账号不存在")
+                    auto_saved = value.get("auto_saved", True)
+                    interval = int(value.get("saved_interval_minutes", 360))
+                    if not isinstance(auto_saved, bool) or not 30 <= interval <= 10080:
+                        raise ValueError("已保存帖子同步间隔必须为 30 到 10080 分钟")
                 self.server.db.set_setting("media_subdir", subdir)
+                if account_id:
+                    self.server.db.set_saved_schedule(account_id, auto_saved, interval)
                 return self.reply(200, {"media_subdir": subdir,
-                                        "media_path": str(target)})
+                                        "media_path": str(target),
+                                        "auto_saved": auto_saved,
+                                        "saved_interval_minutes": interval})
             account_id = str(value.get("account", ""))
             if path == "/api/accounts":
                 name = str(value.get("username", "")).strip().lower().lstrip("@")
@@ -233,18 +251,70 @@ class Handler(BaseHTTPRequestHandler):
                 name = str(value.get("username", "")).strip().lower().lstrip("@")
                 if not USERNAME.fullmatch(name):
                     raise ValueError("博主用户名无效")
-                self.server.db.upsert_creator(account_id, name, manual=True, enabled=True)
-                self.server.db.set_creator(account_id, name, enabled=True)
+                self.server.db.add_creator(account_id, name)
                 return self.reply(201, {"ok": True})
             if path == "/api/creator":
                 name = str(value.get("username", ""))
-                if not USERNAME.fullmatch(name) or not isinstance(value.get("enabled"), bool) or not isinstance(value.get("full_sync"), bool):
+                if not USERNAME.fullmatch(name):
                     raise ValueError("博主参数无效")
-                if not self.server.db.set_creator(account_id, name, value["enabled"], value["full_sync"]):
+                enabled = value.get("enabled")
+                sync_mode = value.get("sync_mode")
+                interval = value.get("interval_minutes")
+                maximum = value.get("max_per_run")
+                if enabled is not None and not isinstance(enabled, bool):
+                    raise ValueError("自动同步开关无效")
+                if sync_mode is not None and sync_mode not in ("recent20", "all"):
+                    raise ValueError("同步范围无效")
+                if interval is not None and (isinstance(interval, bool) or not 30 <= int(interval) <= 10080):
+                    raise ValueError("同步间隔必须为 30 到 10080 分钟")
+                if maximum is not None and (isinstance(maximum, bool) or not 1 <= int(maximum) <= 200):
+                    raise ValueError("每轮下载上限必须为 1 到 200 条")
+                if not self.server.db.set_creator(account_id, name, enabled=enabled,
+                                                 sync_mode=sync_mode,
+                                                 interval_minutes=int(interval) if interval is not None else None,
+                                                 max_per_run=int(maximum) if maximum is not None else None):
                     raise ValueError("博主不存在")
                 return self.reply(200, {"ok": True})
+            if path == "/api/creator/delete":
+                name = str(value.get("username", ""))
+                mode = value.get("mode")
+                if not USERNAME.fullmatch(name) or mode not in ("list", "archive"):
+                    raise ValueError("删除参数无效")
+                result = self.server.db.delete_creator(account_id, name, delete_archive=(mode == "archive"))
+                if result is None:
+                    raise ValueError("博主不存在")
+                removed_files, file_errors = 0, []
+                if mode == "archive":
+                    roots = [self.server.archive_root, (self.server.db.root / "media").resolve()]
+                    for raw in result["files"]:
+                        relative = Path(raw)
+                        if relative.is_absolute() or ".." in relative.parts:
+                            file_errors.append(raw)
+                            continue
+                        for root in roots:
+                            file = (root / relative).resolve()
+                            if not file.is_relative_to(root):
+                                continue
+                            try:
+                                if file.is_file():
+                                    file.unlink()
+                                    removed_files += 1
+                                parent = file.parent
+                                while parent != root and parent.is_relative_to(root):
+                                    try:
+                                        parent.rmdir()
+                                    except OSError:
+                                        break
+                                    parent = parent.parent
+                            except OSError:
+                                file_errors.append(raw)
+                return self.reply(200, {"ok": True, "removed_posts": result["removed_posts"],
+                                        "shared_posts": result["shared_posts"],
+                                        "removed_files": removed_files, "file_errors": file_errors})
             if path == "/api/sync":
-                return self.reply(202, {"run_id": self.server.coordinator.start(account_id, value.get("kind"))})
+                kind = value.get("kind")
+                username = value.get("username")
+                return self.reply(202, {"run_id": self.server.coordinator.start(account_id, kind, username)})
             self.reply(404, {"error": "未找到"})
         except (ValueError, TypeError, sqlite3.IntegrityError) as exc:
             self.reply(400, {"error": str(exc)[:200]})
@@ -260,9 +330,8 @@ def main():
     (root / "tmp").mkdir(exist_ok=True)
     archive_root.mkdir(parents=True, exist_ok=True)
     db = Database(root)
-    service = SyncService(db, root, max_posts=int(os.environ.get("INS_MAX_POSTS", "20")),
-                          archive_root=archive_root)
-    coordinator = Coordinator(db, service, interval_hours=int(os.environ.get("INS_INTERVAL_HOURS", "6")))
+    service = SyncService(db, root, archive_root=archive_root)
+    coordinator = Coordinator(db, service)
     coordinator.schedule()
     server = AppServer(("0.0.0.0", int(os.environ.get("INS_PORT", "18080"))),
                        db, coordinator, password, archive_root)

@@ -8,20 +8,29 @@
   <script src="/app.js" defer></script>
 </head>
 <body>
-  <header><div><strong>ins.net</strong><span>Instagram 本地归档</span></div><button id="refresh" hidden>刷新</button></header>
+  <header><div><strong>ins.net</strong><span>Instagram 本地归档</span><small id="build-version">版本检测中</small></div><button id="refresh" hidden>刷新</button></header>
   <main>
     <section id="login" class="panel narrow"><h1>登录归档</h1><form id="login-form"><label>管理密码<input name="password" type="password" autocomplete="current-password" required></label><button>登录</button></form></section>
     <div id="workspace" hidden>
-      <section class="intro"><h1>你的 Instagram 归档</h1><p>只同步你勾选的关注博主，以及你保存的帖子。每位博主可选最新 20 条或全部历史；轮播会逐项保留图片和视频。</p></section>
+      <section class="intro"><h1>你的 Instagram 归档</h1><p>只同步你手动添加的博主和自己保存的帖子。博主可选最新 20 条或完整历史；每条帖子下载后都会去重，已完整归档的文件会直接跳过。</p></section>
       <div id="notice" role="status"></div>
       <section class="panel"><div class="title"><h2>账号</h2><select id="account"></select></div>
-        <details><summary>添加账号 / 更新 Cookie</summary><form id="account-form"><label>Instagram 用户名<input name="username" placeholder="your_username" required></label><label>Netscape 格式 Cookie 文件<input name="cookies" type="file" accept=".txt" required></label><button>保存账号</button></form><p class="hint">Cookie 保存在本地数据目录，必须包含 instagram.com 的 sessionid。相同用户名会更新 Cookie。请勿上传到公开仓库。</p></details>
+        <details><summary>添加账号 / 更新 Cookie</summary><form id="account-form"><label>Instagram 用户名<input name="username" placeholder="your_username" required></label><label>Netscape 格式 Cookie 文件<input name="cookies" type="file" accept=".txt" required></label><button>保存账号</button></form><p class="hint">Cookie 保存在本地数据目录，必须包含 instagram.com 的 sessionid。相同用户名会更新 Cookie，请勿上传到公开仓库。</p></details>
       </section>
-      <section class="panel" id="actions"><div class="title"><h2>同步</h2><span class="hint">后台每 6 小时自动同步一次（可配置）</span></div><div class="buttons"><button data-kind="following">导入关注列表</button><button data-kind="creators">同步博主</button><button data-kind="saved">同步已保存</button><button data-kind="all" class="primary">全部同步</button></div></section>
-      <section class="panel"><div class="title"><h2>归档位置</h2><span class="hint">NAS 根目录在 Compose 的 /archive 映射中设置</span></div><form id="settings-form"><label>保存子目录（相对于 NAS 根目录）<input name="media_subdir" placeholder="Instagram" maxlength="180"></label><button>保存位置</button></form><p id="save-path" class="hint"></p></section>
-      <section class="panel"><div class="title"><h2>关注博主</h2><span class="hint">导入后逐个勾选要监控的博主</span></div><form id="creator-form"><input name="username" placeholder="手动添加博主用户名" aria-label="博主用户名" required><button>添加并监控</button></form><div id="creators" class="creator-list"></div></section>
+      <section class="panel"><div class="title"><h2>同步已保存</h2><span class="hint">自动同步间隔可在下方设置</span></div><button id="saved-sync" class="primary">立即同步已保存帖子</button></section>
+      <section class="panel"><div class="title"><h2>归档设置</h2><span class="hint">NAS 根目录在 Compose 的 /archive 映射中设置</span></div>
+        <form id="settings-form">
+          <label>保存子目录（相对于 NAS 根目录）<input name="media_subdir" placeholder="Instagram" maxlength="180"></label>
+          <div class="setting-row"><label class="check"><input name="auto_saved" type="checkbox"> 自动同步已保存帖子</label><label>同步间隔（分钟）<input name="saved_interval_minutes" type="number" min="30" max="10080" step="1" required></label></div>
+          <button>保存设置</button>
+        </form><p id="save-path" class="hint"></p>
+      </section>
+      <section class="panel"><div class="title"><h2>监控博主</h2><span class="hint">手动添加；每位博主独立设置同步策略</span></div>
+        <form id="creator-form"><input name="username" placeholder="Instagram 用户名，例如 nasa" aria-label="博主用户名" required><button>添加博主</button></form>
+        <div id="creators" class="creator-list"></div>
+      </section>
       <section class="panel"><div class="title"><h2>归档记录</h2><span id="post-count" class="hint"></span></div><div id="posts" class="post-list"></div></section>
-      <section class="panel"><h2>最近任务与运行日志</h2><p class="hint">展开“查看日志”可查看扫描来源、进度和详细错误。</p><div id="runs" class="run-list"></div></section>
+      <section class="panel"><h2>最近任务与运行日志</h2><p class="hint">展开“查看运行日志”可查看扫描进度、每条帖子处理结果和详细错误。</p><div id="runs" class="run-list"></div></section>
     </div>
   </main>
 </body>
