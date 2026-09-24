@@ -49,7 +49,7 @@ docker compose up -d --build
 
 ## 技术说明
 
-关注列表通过 Instaloader 的登录会话接口读取，帖子、Reels 和已保存列表通过 `gallery-dl` 读取；媒体下载在暂存目录完成，再移动到归档目录。运行日志保存在 SQLite，可在网页读取；Cookie 值会从采集器错误输出中遮盖。记录按账号和帖子短码去重，媒体按 `media_id` 去重。程序不会把图片合成视频，也不会另外保存视频封面或音轨。
+关注列表通过 Instaloader 的登录会话接口读取，帖子、Reels 和已保存列表通过 `gallery-dl` 读取；媒体先下载到暂存目录，再复制到归档目录内的临时文件并原子替换，支持 `/data` 与 `/archive` 位于不同挂载点。运行日志保存在 SQLite，可在网页读取；Cookie 值会从采集器错误输出中遮盖。记录按账号和帖子短码去重，媒体按 `media_id` 去重。程序不会把图片合成视频，也不会另外保存视频封面或音轨。
 
 ```sh
 python3 -m unittest discover -s tests -v

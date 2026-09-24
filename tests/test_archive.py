@@ -2,12 +2,14 @@ import tempfile
 import unittest
 import sys
 import types
+import errno
+import os
 from types import SimpleNamespace
 from pathlib import Path
 from unittest.mock import patch
 
 from insnet.db import Database
-from insnet.engine import GalleryDL, GalleryError, following_from_messages, normalize_messages
+from insnet.engine import GalleryDL, GalleryError, following_from_messages, normalize_messages, redact_output
 from insnet.sync import Coordinator, SyncService
 from insnet.web import valid_cookie_file
 
@@ -77,6 +79,34 @@ class ArchiveTests(unittest.TestCase):
             self.assertEqual(counts["skipped"], 1)
             self.assertEqual(fake.calls, 2)
 
+    def test_archive_copies_across_mounts_before_atomic_replace(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            (root / "tmp").mkdir()
+            archive = root / "archive"
+            archive.mkdir()
+            db = Database(root)
+            account_id = db.add_account("owner", root / "cookies.txt")
+            account = db.account(account_id)
+            fake = FakeGallery()
+            fake.partial = False
+            service = SyncService(db, root, fake, archive_root=archive)
+            real_replace = os.replace
+
+            def fail_on_cross_mount(src, dst):
+                if Path(src).parent.resolve() != Path(dst).parent.resolve():
+                    raise OSError(errno.EXDEV, "Invalid cross-device link")
+                return real_replace(src, dst)
+
+            with patch("insnet.sync.os.replace", side_effect=fail_on_cross_mount):
+                counts, error = service.run(account, "saved")
+
+            self.assertEqual(counts["downloaded"], 1)
+            self.assertEqual(counts["failed"], 0)
+            self.assertEqual(error, "")
+            media = db.posts(account_id)[0]["media"]
+            self.assertTrue(all((archive / row["relative_path"]).is_file() for row in media))
+
     def test_only_selected_creators_are_scanned_latest_20_or_all(self):
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
@@ -108,6 +138,19 @@ class ArchiveTests(unittest.TestCase):
             self.assertIn("HTTP 401", str(caught.exception))
             self.assertNotIn("super_secret_token", str(caught.exception))
 
+    def test_redaction_preserves_urls_when_cookie_values_are_short(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            cookie = Path(temporary) / "cookies.txt"
+            cookie.write_text(
+                ".instagram.com\tTRUE\t/\tTRUE\t0\tlocale\ten\n"
+                ".instagram.com\tTRUE\t/\tTRUE\t0\tds_user_id\t123456789\n"
+            )
+            message = "https://www.instagram.com/api/v1/users/web_profile_info/?username=666&locale=en 123456789"
+            cleaned = redact_output(message, cookie)
+            self.assertIn("/api/v1/users/web_profile_info/?username=666", cleaned)
+            self.assertIn("en", cleaned)
+            self.assertNotIn("123456789", cleaned)
+
     def test_following_import_uses_logged_in_profile_api(self):
         with tempfile.TemporaryDirectory() as temporary:
             cookie = Path(temporary) / "cookies.txt"
@@ -128,9 +171,14 @@ class ArchiveTests(unittest.TestCase):
 
             class FakeProfile:
                 @staticmethod
-                def from_username(context, username):
+                def own_profile(context):
                     return SimpleNamespace(get_followees=lambda: iter([
-                        SimpleNamespace(username="Zed"), SimpleNamespace(username="alice")]))
+                        SimpleNamespace(username="Zed"), SimpleNamespace(username="alice")]),
+                        username="owner")
+
+                @staticmethod
+                def from_username(context, username):
+                    raise AssertionError("from_username would call the rate-limited endpoint")
 
             fake_module = types.ModuleType("instaloader")
             fake_module.Instaloader = FakeLoader
@@ -142,6 +190,36 @@ class ArchiveTests(unittest.TestCase):
             self.assertEqual(loaded["username"], "owner")
             self.assertEqual(loaded["cookies"]["sessionid"], "session-secret")
             self.assertEqual(progress, [2])
+
+    def test_following_rate_limit_gives_retry_guidance(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            cookie = Path(temporary) / "cookies.txt"
+            cookie.write_text(
+                ".instagram.com\tTRUE\t/\tTRUE\t0\tsessionid\tsession-secret\n"
+                ".instagram.com\tTRUE\t/\tTRUE\t0\tcsrftoken\tcsrf-secret\n"
+            )
+
+            class FakeLoader:
+                def __init__(self, **kwargs):
+                    self.context = SimpleNamespace(load_session=lambda username, values: None)
+
+                def close(self):
+                    pass
+
+            class FakeProfile:
+                @staticmethod
+                def own_profile(context):
+                    raise RuntimeError("429 Too Many Requests")
+
+            fake_module = types.ModuleType("instaloader")
+            fake_module.Instaloader = FakeLoader
+            fake_module.Profile = FakeProfile
+            with patch.dict(sys.modules, {"instaloader": fake_module}):
+                with self.assertRaises(GalleryError) as caught:
+                    GalleryDL().following(cookie, "owner")
+
+            self.assertIn("等待 15–30 分钟", str(caught.exception))
+            self.assertIn("429 Too Many Requests", str(caught.exception))
 
     def test_following_failure_is_saved_with_detail(self):
         class BrokenGallery:

@@ -3,6 +3,7 @@
 import os
 import re
 import shutil
+import tempfile
 import threading
 from pathlib import Path
 from tempfile import TemporaryDirectory
@@ -12,6 +13,19 @@ from .engine import GalleryDL, GalleryError
 
 def safe_part(value):
     return re.sub(r"[^A-Za-z0-9._-]", "_", str(value))[:80].strip(".") or "unknown"
+
+
+def replace_from_staging(candidate, target):
+    """Copy across mounts, then atomically replace from a temp file beside target."""
+    candidate, target = Path(candidate), Path(target)
+    fd, temporary_name = tempfile.mkstemp(prefix=f".{target.name}.", suffix=".part", dir=target.parent)
+    os.close(fd)
+    temporary = Path(temporary_name)
+    try:
+        shutil.copy2(candidate, temporary)
+        os.replace(temporary, target)
+    finally:
+        temporary.unlink(missing_ok=True)
 
 
 class SyncService:
@@ -101,7 +115,7 @@ class SyncService:
                     target = self.archive_root / relative / filename
                     target.parent.mkdir(parents=True, exist_ok=True)
                     size = candidate.stat().st_size
-                    os.replace(candidate, target)
+                    replace_from_staging(candidate, target)
                     self.db.set_media_file(post_id, row["media_id"], str(relative / filename), size, extension)
             remaining = [r for r in self.db.post_media(post_id) if not r["relative_path"] or not
                          (self.archive_root / r["relative_path"]).is_file()]

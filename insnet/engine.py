@@ -28,7 +28,9 @@ def redact_output(value, cookie_path):
     try:
         for line in Path(cookie_path).read_text(encoding="utf-8", errors="replace").splitlines():
             fields = line.removeprefix("#HttpOnly_").split("\t")
-            if len(fields) >= 7 and fields[6]:
+            # Cookie jars also contain short values such as "1" and "en".
+            # Replacing those substrings corrupts useful URLs and diagnostics.
+            if len(fields) >= 7 and len(fields[6]) >= 8:
                 text = text.replace(fields[6], "[COOKIE_REDACTED]")
     except OSError:
         pass
@@ -134,7 +136,7 @@ class GalleryDL:
         return messages
 
     def following(self, cookie_path, username, progress=None):
-        """Read the logged-in account's followees through Instaloader's maintained profile API."""
+        """Read the logged-in account's followees through Instaloader's authenticated API."""
         loader = None
         try:
             import instaloader
@@ -152,7 +154,15 @@ class GalleryDL:
 
             loader = instaloader.Instaloader(quiet=True, sleep=True, max_connection_attempts=1)
             loader.context.load_session(username, cookies)
-            profile = instaloader.Profile.from_username(loader.context, username)
+            # from_username() requests web_profile_info, which Instagram may throttle
+            # with HTTP 429 even when the authenticated session is valid. own_profile()
+            # uses the authenticated GraphQL session and avoids that endpoint.
+            profile = instaloader.Profile.own_profile(loader.context)
+            profile_username = str(profile.username).strip().lower()
+            if profile_username != username.strip().lower():
+                raise GalleryError(
+                    f"Cookie 当前登录的是 @{profile_username}，与配置账号 @{username} 不一致；请更新该账号的 Cookie。"
+                )
             names = []
             for followee in profile.get_followees():
                 name = str(followee.username).strip().lower()
@@ -167,7 +177,10 @@ class GalleryDL:
             raise
         except Exception as exc:
             detail = redact_output(str(exc), cookie_path)
-            message = f"Instaloader 读取关注列表失败（{type(exc).__name__}）"
+            if re.search(r"\b429\b|too many requests", detail, re.IGNORECASE):
+                message = "Instagram 暂时限制了关注列表请求（HTTP 429）。请暂停同步，等待 15–30 分钟后再试一次；连续重试可能延长限制。"
+            else:
+                message = f"Instaloader 读取关注列表失败（{type(exc).__name__}）"
             if detail:
                 message += f"：{detail}"
             else:
