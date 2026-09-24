@@ -20,16 +20,20 @@ from .sync import Coordinator, SyncService
 
 
 STATIC = Path(__file__).resolve().parent.parent / "static"
+APP_VERSION = "0.3.0"
 
 
 def valid_cookie_file(value):
     if not isinstance(value, str) or len(value.encode("utf-8")) > 256 * 1024:
         return False
+    required = {"sessionid", "csrftoken"}
+    found = set()
     for line in value.splitlines():
         fields = line.lstrip("#HttpOnly_").split("\t") if line.startswith("#HttpOnly_") else line.split("\t")
-        if len(fields) >= 7 and fields[0].lstrip(".").lower() == "instagram.com" and fields[5] == "sessionid" and fields[6]:
-            return True
-    return False
+        if len(fields) >= 7 and fields[0].lstrip(".").lower() == "instagram.com" \
+                and fields[5] in required and fields[6]:
+            found.add(fields[5])
+    return required <= found
 
 
 class AppServer(ThreadingHTTPServer):
@@ -88,9 +92,12 @@ class Handler(BaseHTTPRequestHandler):
             self.send_header("Content-Type", mimetypes.guess_type(name)[0] or "text/plain")
             self.send_header("Content-Length", str(len(data)))
             self.send_header("X-Content-Type-Options", "nosniff")
+            self.send_header("Cache-Control", "no-store, max-age=0")
             self.end_headers()
             self.wfile.write(data)
             return
+        if path == "/api/version":
+            return self.reply(200, {"version": APP_VERSION})
         if not self.authorized():
             return self.reply(401, {"error": "请先登录"})
         query = parse_qs(urlparse(self.path).query)
@@ -124,9 +131,15 @@ class Handler(BaseHTTPRequestHandler):
         row = next((r for r in self.server.db.post_media(post_id) if r["media_id"] == media_id), None) if post else None
         if not row or not row["relative_path"]:
             return self.reply(404, {"error": "媒体不存在"})
-        base = (self.server.db.root / "media").resolve()
-        file = (base / row["relative_path"]).resolve()
-        if not file.is_relative_to(base) or not file.is_file():
+        relative = Path(row["relative_path"])
+        file = None
+        for base in (self.server.archive_root, self.server.db.root / "media"):
+            base = base.resolve()
+            candidate = (base / relative).resolve()
+            if candidate.is_relative_to(base) and candidate.is_file():
+                file = candidate
+                break
+        if file is None:
             return self.reply(404, {"error": "媒体不存在"})
         size = file.stat().st_size
         start, end = 0, size - 1
@@ -201,7 +214,7 @@ class Handler(BaseHTTPRequestHandler):
                 name = str(value.get("username", "")).strip().lower().lstrip("@")
                 cookie = value.get("cookies")
                 if not USERNAME.fullmatch(name) or not valid_cookie_file(cookie):
-                    raise ValueError("用户名或 Netscape Cookie 文件无效（需含 instagram.com 的 sessionid）")
+                    raise ValueError("用户名或 Netscape Cookie 文件无效（需含 instagram.com 的 sessionid 和 csrftoken）")
                 existing = self.server.db.account_by_username(name)
                 account_id = existing["id"] if existing else self.server.db.add_account(name, "pending")
                 target = self.server.db.root / "accounts" / account_id / "cookies.txt"

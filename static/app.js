@@ -1,5 +1,6 @@
 const $ = s => document.querySelector(s);
 let current = '', items = [];
+let refreshTimer;
 async function api(path, data) {
   const options = data === undefined ? {} : {method:'POST',headers:{'Content-Type':'application/json','X-Insnet-Action':'1'},body:JSON.stringify(data)};
   const response = await fetch(path, options);
@@ -11,6 +12,7 @@ function notice(message, error=false) { $('#notice').textContent=message; $('#no
 function node(tag, text, className) { const e=document.createElement(tag); if(text!==undefined)e.textContent=text; if(className)e.className=className; return e; }
 function stamp(s) { return s ? String(s).replace('T',' ').slice(0,19) : '日期未知'; }
 async function refresh() {
+  clearTimeout(refreshTimer);
   const [accounts, settings] = await Promise.all([api('/api/accounts'),api('/api/settings')]);
   $('#login').hidden=true; $('#workspace').hidden=false; $('#refresh').hidden=false;
   renderSettings(settings);
@@ -23,6 +25,7 @@ async function refresh() {
     api('/api/creators?account='+encodeURIComponent(current)),
     api('/api/posts?account='+encodeURIComponent(current)), api('/api/runs')]);
   renderCreators(creators); renderPosts(posts); renderRuns(runs);
+  if(runs.some(run=>run.status==='running'))refreshTimer=setTimeout(()=>refresh().catch(err=>notice(err.message,true)),3000);
 }
 function renderCreators(creators) {
   const host=$('#creators');host.replaceChildren();
@@ -54,11 +57,12 @@ function renderPosts(posts){
     show();body.append(headline,date,caption,link);card.append(viewer,body);host.append(card);
   }
 }
-function renderRuns(runs){const host=$('#runs');host.replaceChildren();if(!runs.length){host.textContent='暂无任务。';return}for(const run of runs){
+function renderRuns(runs){const host=$('#runs');const expanded=new Set([...host.querySelectorAll('details[open]')].map(el=>el.dataset.runId));host.replaceChildren();if(!runs.length){host.textContent='暂无任务。';return}for(const run of runs){
   const row=node('div',undefined,'run');row.append(node('strong',`@${run.username} · ${run.kind} · ${run.status}`),node('small',`　${stamp(run.started_at)}　下载 ${run.downloaded} / 跳过 ${run.skipped} / 失败 ${run.failed}`));
-  if(run.message){const detail=node('details','', 'run-error');detail.append(node('summary','任务错误摘要'));detail.append(node('pre',run.message));row.append(detail)}
-  const detail=node('details',undefined,'run-logs');detail.ontoggle=()=>{if(detail.open)loadRunLogs(run.id,detail)};
-  detail.append(node('summary','查看运行日志'));row.append(detail);host.append(row);
+  if(run.message)row.append(node('pre',run.message,'run-error'));
+  const detail=node('details',undefined,'run-logs');detail.dataset.runId=run.id;detail.ontoggle=()=>{if(detail.open)loadRunLogs(run.id,detail)};
+  detail.append(node('summary',`查看运行日志（${run.log_count||0} 条）`));row.append(detail);host.append(row);
+  if(expanded.has(run.id)||run.status==='failed'||run.status==='partial')detail.open=true;
 }}
 async function loadRunLogs(runId,container){
   const old=container.querySelector('.log-lines');if(old)old.remove();
@@ -79,5 +83,6 @@ $('#creator-form').onsubmit=async e=>{e.preventDefault();try{await api('/api/cre
 $('#settings-form').onsubmit=async e=>{e.preventDefault();try{const settings=await api('/api/settings',{media_subdir:e.target.elements.namedItem('media_subdir').value});renderSettings(settings);notice('保存位置已更新')}catch(err){notice(err.message,true)}};
 $('#account').onchange=e=>{current=e.target.value;refresh().catch(err=>notice(err.message,true))};
 $('#refresh').onclick=()=>refresh().catch(err=>notice(err.message,true));
-document.querySelectorAll('[data-kind]').forEach(b=>b.onclick=async()=>{try{await api('/api/sync',{account:current,kind:b.dataset.kind});notice('任务已启动，可稍后刷新查看进度');await refresh()}catch(err){notice(err.message,true)}});
+document.querySelectorAll('[data-kind]').forEach(b=>b.onclick=async()=>{try{await api('/api/sync',{account:current,kind:b.dataset.kind});notice('任务已在后台启动，页面会自动刷新进度');await refresh()}catch(err){notice(err.message,true)}});
+api('/api/version').then(version=>{$('#build-version').textContent='版本 '+version.version}).catch(()=>{$('#build-version').textContent='版本未知'});
 refresh().catch(()=>{});

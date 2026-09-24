@@ -2,6 +2,7 @@
 
 import os
 import re
+import shutil
 import threading
 from pathlib import Path
 from tempfile import TemporaryDirectory
@@ -27,14 +28,52 @@ class SyncService:
 
     def import_following(self, account, log=None):
         self._log(log, "INFO", "following", f"正在读取 @{account['username']} 的关注列表")
-        names = self.gallery.following(account["cookie_path"], account["username"])
+        names = self.gallery.following(
+            account["cookie_path"], account["username"],
+            progress=lambda count: self._log(log, "INFO", "following", f"已读取 {count} 位关注博主"),
+        )
         for username in names:
             self.db.upsert_creator(account["id"], username)
         self._log(log, "INFO", "following", f"读取完成：共 {len(names)} 位博主；新导入项默认不监控，请手动勾选")
         return len(names)
 
+    def _restore_legacy_media(self, post_id, row, log=None):
+        """Copy files from the original /data/media volume into the configured archive mount."""
+        if not row["relative_path"]:
+            return
+        relative = Path(row["relative_path"])
+        legacy_root = (self.root / "media").resolve()
+        try:
+            if relative.is_absolute() or ".." in relative.parts:
+                return
+            archived = (self.archive_root / relative).resolve()
+            archived.relative_to(self.archive_root.resolve())
+            if archived.is_file():
+                return
+            legacy = (legacy_root / relative).resolve()
+            legacy.relative_to(legacy_root)
+            if not legacy.is_file():
+                return
+            subdir = self.db.setting("media_subdir", "Instagram").strip("/")
+            prefix = Path(subdir) if subdir else Path()
+            target_relative = relative if not prefix.parts or relative.parts[:len(prefix.parts)] == prefix.parts \
+                              else prefix / relative
+            target = (self.archive_root / target_relative).resolve()
+            target.relative_to(self.archive_root.resolve())
+            target.parent.mkdir(parents=True, exist_ok=True)
+            shutil.copy2(legacy, target)
+            self.db.set_media_file(post_id, row["media_id"], target_relative.as_posix(),
+                                   target.stat().st_size, row["extension"])
+            self._log(log, "INFO", "archive", f"旧归档已复制到设置的保存目录：{target_relative}")
+        except (OSError, ValueError):
+            # Keep the old record visible via the media endpoint's legacy-root fallback.
+            return
+
     def _archive(self, account, post, source, log=None):
         post_id = self.db.upsert_post(account["id"], post, source)
+        rows = self.db.post_media(post_id)
+        for row in rows:
+            self._restore_legacy_media(post_id, row, log)
         rows = self.db.post_media(post_id)
         missing = [row for row in rows if not row["relative_path"] or not
                    (self.archive_root / row["relative_path"]).is_file()]

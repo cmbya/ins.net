@@ -4,6 +4,7 @@ import hashlib
 import json
 import re
 import subprocess
+from contextlib import suppress
 from collections import OrderedDict
 from pathlib import Path
 from urllib.parse import urlparse
@@ -132,8 +133,50 @@ class GalleryDL:
             raise GalleryError("gallery-dl 提取失败。\n" + redact_output(details or errors, cookie_path))
         return messages
 
-    def following(self, cookie_path, username):
-        return following_from_messages(self._json(cookie_path, f"https://www.instagram.com/{username}/following/"))
+    def following(self, cookie_path, username, progress=None):
+        """Read the logged-in account's followees through Instaloader's maintained profile API."""
+        loader = None
+        try:
+            import instaloader
+
+            cookies = {}
+            for line in Path(cookie_path).read_text(encoding="utf-8", errors="replace").splitlines():
+                line = line.removeprefix("#HttpOnly_")
+                if not line or line.lstrip().startswith("#"):
+                    continue
+                fields = line.split("\t")
+                if len(fields) >= 7 and fields[0].lstrip(".").lower() == "instagram.com" and fields[6]:
+                    cookies[fields[5]] = fields[6]
+            if not cookies.get("sessionid") or not cookies.get("csrftoken"):
+                raise GalleryError("Cookie 文件缺少 instagram.com 的 sessionid 或 csrftoken，请重新导出 Cookie。")
+
+            loader = instaloader.Instaloader(quiet=True, sleep=True, max_connection_attempts=1)
+            loader.context.load_session(username, cookies)
+            profile = instaloader.Profile.from_username(loader.context, username)
+            names = []
+            for followee in profile.get_followees():
+                name = str(followee.username).strip().lower()
+                if USERNAME.fullmatch(name):
+                    names.append(name)
+                    if progress and len(names) % 50 == 0:
+                        progress(len(names))
+            if progress and names and len(names) % 50:
+                progress(len(names))
+            return sorted(set(names))
+        except GalleryError:
+            raise
+        except Exception as exc:
+            detail = redact_output(str(exc), cookie_path)
+            message = f"Instaloader 读取关注列表失败（{type(exc).__name__}）"
+            if detail:
+                message += f"：{detail}"
+            else:
+                message += "。请检查运行日志；若提示登录或挑战验证，请重新导出有效 Cookie。"
+            raise GalleryError(message) from exc
+        finally:
+            if loader is not None:
+                with suppress(Exception):
+                    loader.close()
 
     def posts(self, cookie_path, url, max_posts=None):
         return normalize_messages(self._json(cookie_path, url, max_posts))

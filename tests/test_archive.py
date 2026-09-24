@@ -1,12 +1,14 @@
 import tempfile
 import unittest
+import sys
+import types
 from types import SimpleNamespace
 from pathlib import Path
 from unittest.mock import patch
 
 from insnet.db import Database
 from insnet.engine import GalleryDL, GalleryError, following_from_messages, normalize_messages
-from insnet.sync import SyncService
+from insnet.sync import Coordinator, SyncService
 from insnet.web import valid_cookie_file
 
 
@@ -106,6 +108,81 @@ class ArchiveTests(unittest.TestCase):
             self.assertIn("HTTP 401", str(caught.exception))
             self.assertNotIn("super_secret_token", str(caught.exception))
 
+    def test_following_import_uses_logged_in_profile_api(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            cookie = Path(temporary) / "cookies.txt"
+            cookie.write_text(
+                "# Netscape HTTP Cookie File\n"
+                ".instagram.com\tTRUE\t/\tTRUE\t0\tsessionid\tsession-secret\n"
+                ".instagram.com\tTRUE\t/\tTRUE\t0\tcsrftoken\tcsrf-secret\n"
+            )
+            loaded = {}
+
+            class FakeLoader:
+                def __init__(self, **kwargs):
+                    self.context = SimpleNamespace(load_session=lambda username, values:
+                                                   loaded.update(username=username, cookies=values))
+
+                def close(self):
+                    pass
+
+            class FakeProfile:
+                @staticmethod
+                def from_username(context, username):
+                    return SimpleNamespace(get_followees=lambda: iter([
+                        SimpleNamespace(username="Zed"), SimpleNamespace(username="alice")]))
+
+            fake_module = types.ModuleType("instaloader")
+            fake_module.Instaloader = FakeLoader
+            fake_module.Profile = FakeProfile
+            progress = []
+            with patch.dict(sys.modules, {"instaloader": fake_module}):
+                names = GalleryDL().following(cookie, "owner", progress.append)
+            self.assertEqual(names, ["alice", "zed"])
+            self.assertEqual(loaded["username"], "owner")
+            self.assertEqual(loaded["cookies"]["sessionid"], "session-secret")
+            self.assertEqual(progress, [2])
+
+    def test_following_failure_is_saved_with_detail(self):
+        class BrokenGallery:
+            def following(self, cookie_path, username, progress=None):
+                raise GalleryError("HTTP 403 checkpoint_required")
+
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            db = Database(root)
+            account_id = db.add_account("owner", root / "cookies.txt")
+            service = SyncService(db, root, BrokenGallery(), archive_root=root / "archive")
+            coordinator = Coordinator(db, service)
+            run_id = db.create_run(account_id, "following")
+            coordinator._execute(run_id, db.account(account_id), "following")
+            run = db.runs()[0]
+            self.assertEqual(run["status"], "failed")
+            self.assertIn("HTTP 403 checkpoint_required", run["message"])
+            self.assertIn("HTTP 403 checkpoint_required", db.run_logs(run_id)[-1]["message"])
+
+    def test_legacy_media_is_copied_to_archive_mount(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            old_file = root / "media" / "owner" / "creator" / "post.jpg"
+            old_file.parent.mkdir(parents=True)
+            old_file.write_bytes(b"legacy image")
+            archive = root / "archive"
+            archive.mkdir()
+            db = Database(root)
+            account_id = db.add_account("owner", root / "cookies.txt")
+            post = {"shortcode": "ABC123", "username": "creator", "caption": "",
+                    "published_at": "2026-09-01", "source_url": "https://www.instagram.com/p/ABC123/",
+                    "items": [{"media_id": "101", "position": 1, "kind": "image", "extension": "jpg"}]}
+            post_id = db.upsert_post(account_id, post, "saved")
+            db.set_media_file(post_id, "101", "owner/creator/post.jpg", old_file.stat().st_size, "jpg")
+            service = SyncService(db, root, archive_root=archive)
+            service._restore_legacy_media(post_id, db.post_media(post_id)[0])
+            row = db.post_media(post_id)[0]
+            self.assertEqual(row["relative_path"], "Instagram/owner/creator/post.jpg")
+            self.assertEqual((archive / row["relative_path"]).read_bytes(), b"legacy image")
+            self.assertTrue(old_file.exists())
+
     def test_run_logs_are_persisted_in_order(self):
         with tempfile.TemporaryDirectory() as temporary:
             db = Database(temporary)
@@ -114,9 +191,13 @@ class ArchiveTests(unittest.TestCase):
             db.add_run_log(run_id, "info", "following", "start")
             db.add_run_log(run_id, "error", "following", "HTTP 401")
             self.assertEqual([line["message"] for line in db.run_logs(run_id)], ["start", "HTTP 401"])
+            self.assertEqual(db.runs()[0]["log_count"], 2)
 
     def test_cookie_requires_instagram_session(self):
-        self.assertTrue(valid_cookie_file(".instagram.com\tTRUE\t/\tTRUE\t0\tsessionid\tsecret\n"))
+        self.assertTrue(valid_cookie_file(
+            ".instagram.com\tTRUE\t/\tTRUE\t0\tsessionid\tsecret\n"
+            ".instagram.com\tTRUE\t/\tTRUE\t0\tcsrftoken\tcsrf\n"))
+        self.assertFalse(valid_cookie_file(".instagram.com\tTRUE\t/\tTRUE\t0\tsessionid\tsecret\n"))
         self.assertFalse(valid_cookie_file("evil.com\tTRUE\t/\tTRUE\t0\tsessionid\tsecret\n"))
 
 

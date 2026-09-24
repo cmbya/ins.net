@@ -5,7 +5,7 @@ RUN sed -i 's|http://deb.debian.org|https://deb.debian.org|g' /etc/apt/sources.l
     && apt-get update -o Acquire::Retries=3 -o APT::Update::Error-Mode=any \
     && apt-get install -y --no-install-recommends ffmpeg ca-certificates \
     && rm -rf /var/lib/apt/lists/* \
-    && pip install --no-cache-dir gallery-dl==1.32.13 yt-dlp==2026.08.19
+    && pip install --no-cache-dir gallery-dl==1.32.13 yt-dlp==2026.08.19 instaloader==4.15.3
 WORKDIR /app
 COPY insnet/ /app/insnet/
 COPY static/ /app/static/
