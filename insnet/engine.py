@@ -18,6 +18,22 @@ class GalleryError(Exception):
     pass
 
 
+def redact_output(value, cookie_path):
+    if isinstance(value, (list, tuple)):
+        text = "\n".join(x.decode("utf-8", "replace") if isinstance(x, bytes) else str(x)
+                           for x in value if x)
+    else:
+        text = value.decode("utf-8", "replace") if isinstance(value, bytes) else str(value or "")
+    try:
+        for line in Path(cookie_path).read_text(encoding="utf-8", errors="replace").splitlines():
+            fields = line.removeprefix("#HttpOnly_").split("\t")
+            if len(fields) >= 7 and fields[6]:
+                text = text.replace(fields[6], "[COOKIE_REDACTED]")
+    except OSError:
+        pass
+    return re.sub(r"\x1b\[[0-9;]*m", "", text).strip()[-5000:]
+
+
 def normalize_messages(messages):
     """Group URL messages by Instagram shortcode; retain carousel item order."""
     groups = OrderedDict()
@@ -89,11 +105,14 @@ class GalleryDL:
         try:
             result = subprocess.run(command, capture_output=True, text=True,
                                     timeout=self.timeout, check=False)
-        except (OSError, subprocess.TimeoutExpired) as exc:
-            raise GalleryError(f"gallery-dl 无法运行或超时：{type(exc).__name__}") from exc
+        except subprocess.TimeoutExpired as exc:
+            detail = redact_output((exc.stderr, exc.stdout), cookie_path)
+            raise GalleryError(f"gallery-dl 执行超过 {self.timeout} 秒后超时。\n{detail}") from exc
+        except OSError as exc:
+            raise GalleryError(f"无法启动 gallery-dl：{exc}") from exc
         if result.returncode:
-            # Errors can include private URLs or cookies. Never surface raw subprocess output.
-            raise GalleryError(f"gallery-dl 退出码 {result.returncode}；请检查登录 Cookie、网络与访问权限")
+            detail = redact_output((result.stderr, result.stdout), cookie_path)
+            raise GalleryError(f"gallery-dl 退出码 {result.returncode}。\n{detail or '程序未输出错误详情。'}")
         return result.stdout
 
     def _json(self, cookie_path, url, max_posts=None):
@@ -105,10 +124,12 @@ class GalleryDL:
             messages = json.loads(raw)
         except (ValueError, TypeError) as exc:
             raise GalleryError("gallery-dl 返回了无效元数据") from exc
-        if not isinstance(messages, list) or any(
-            isinstance(msg, list) and msg and msg[0] == -1 for msg in messages
-        ):
-            raise GalleryError("gallery-dl 无法读取元数据；请检查 Cookie 和访问权限")
+        if not isinstance(messages, list):
+            raise GalleryError("gallery-dl 返回的元数据不是列表")
+        errors = [msg[-1] for msg in messages if isinstance(msg, list) and msg and msg[0] == -1]
+        if errors:
+            details = "\n".join(str(item.get("message") or item) for item in errors if isinstance(item, dict))
+            raise GalleryError("gallery-dl 提取失败。\n" + redact_output(details or errors, cookie_path))
         return messages
 
     def following(self, cookie_path, username):

@@ -9,7 +9,6 @@ RUN sed -i 's|http://deb.debian.org|https://deb.debian.org|g' /etc/apt/sources.l
 WORKDIR /app
 COPY insnet/ /app/insnet/
 COPY static/ /app/static/
-RUN mkdir /data && chown -R 10001:10001 /data /app
-USER 10001:10001
+RUN mkdir -p /data /archive && chown -R 10001:10001 /data /archive /app
 EXPOSE 18080
-CMD ["python", "-m", "insnet.web"]
+CMD ["python", "-m", "insnet.entrypoint"]

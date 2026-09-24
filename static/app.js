@@ -11,8 +11,9 @@ function notice(message, error=false) { $('#notice').textContent=message; $('#no
 function node(tag, text, className) { const e=document.createElement(tag); if(text!==undefined)e.textContent=text; if(className)e.className=className; return e; }
 function stamp(s) { return s ? String(s).replace('T',' ').slice(0,19) : '日期未知'; }
 async function refresh() {
-  const accounts = await api('/api/accounts');
+  const [accounts, settings] = await Promise.all([api('/api/accounts'),api('/api/settings')]);
   $('#login').hidden=true; $('#workspace').hidden=false; $('#refresh').hidden=false;
+  renderSettings(settings);
   if (!accounts.some(a=>a.id===current)) current=accounts[0]?.id || '';
   $('#account').replaceChildren(...accounts.map(a=>{const o=node('option', '@'+a.username);o.value=a.id;return o}));
   $('#account').value=current;
@@ -29,7 +30,7 @@ function renderCreators(creators) {
   for(const creator of creators){
     const box=node('div',undefined,'creator');
     const first=node('label');const enabled=node('input');enabled.type='checkbox';enabled.checked=!!creator.enabled;first.append(enabled,node('span','@'+creator.username));
-    const second=node('label');const full=node('input');full.type='checkbox';full.checked=!!creator.full_sync;second.append(full,node('small','每次扫描全部历史（更慢）'));
+    const second=node('label');const full=node('input');full.type='checkbox';full.checked=!!creator.full_sync;second.append(full,node('small','扫描全部历史（未选时只取最新 20 条）'));
     async function change(){try{await api('/api/creator',{account:current,username:creator.username,enabled:enabled.checked,full_sync:full.checked});notice('设置已保存')}catch(e){notice(e.message,true)}}
     enabled.onchange=change;full.onchange=change;box.append(first,second);host.append(box);
   }
@@ -55,11 +56,27 @@ function renderPosts(posts){
 }
 function renderRuns(runs){const host=$('#runs');host.replaceChildren();if(!runs.length){host.textContent='暂无任务。';return}for(const run of runs){
   const row=node('div',undefined,'run');row.append(node('strong',`@${run.username} · ${run.kind} · ${run.status}`),node('small',`　${stamp(run.started_at)}　下载 ${run.downloaded} / 跳过 ${run.skipped} / 失败 ${run.failed}`));
-  if(run.message)row.append(node('div',run.message,'error'));host.append(row);
+  if(run.message){const detail=node('details','', 'run-error');detail.append(node('summary','任务错误摘要'));detail.append(node('pre',run.message));row.append(detail)}
+  const detail=node('details',undefined,'run-logs');detail.ontoggle=()=>{if(detail.open)loadRunLogs(run.id,detail)};
+  detail.append(node('summary','查看运行日志'));row.append(detail);host.append(row);
 }}
+async function loadRunLogs(runId,container){
+  const old=container.querySelector('.log-lines');if(old)old.remove();
+  const list=node('div','正在读取日志…','log-lines');container.append(list);
+  try{const lines=await api('/api/runlogs?run='+encodeURIComponent(runId));list.replaceChildren();
+    if(!lines.length){list.textContent='暂无日志';return}
+    for(const item of lines){const line=node('div',`${stamp(item.created_at)} [${item.level}]${item.source?' ['+item.source+']':''} ${item.message}`,'log-line');list.append(line)}
+  }catch(err){list.textContent='读取日志失败：'+err.message}
+}
+function renderSettings(settings){
+  const input=$('#settings-form').elements.namedItem('media_subdir');
+  input.value=settings.media_subdir;
+  $('#save-path').textContent=`当前容器路径：${settings.media_path}（NAS 根目录由 Compose 映射到 /archive）`;
+}
 $('#login-form').onsubmit=async e=>{e.preventDefault();try{await api('/api/login',{password:e.target.password.value});e.target.reset();await refresh()}catch(err){alert(err.message)}};
 $('#account-form').onsubmit=async e=>{e.preventDefault();const form=e.target;try{const file=form.cookies.files[0];if(file.size>256*1024)throw Error('Cookie 文件不能超过 256 KB');const result=await api('/api/accounts',{username:form.username.value,cookies:await file.text()});current=result.id;form.reset();await refresh();notice('账号已添加')}catch(err){notice(err.message,true)}};
 $('#creator-form').onsubmit=async e=>{e.preventDefault();try{await api('/api/creators',{account:current,username:e.target.username.value});e.target.reset();await refresh();notice('已添加博主')}catch(err){notice(err.message,true)}};
+$('#settings-form').onsubmit=async e=>{e.preventDefault();try{const settings=await api('/api/settings',{media_subdir:e.target.elements.namedItem('media_subdir').value});renderSettings(settings);notice('保存位置已更新')}catch(err){notice(err.message,true)}};
 $('#account').onchange=e=>{current=e.target.value;refresh().catch(err=>notice(err.message,true))};
 $('#refresh').onclick=()=>refresh().catch(err=>notice(err.message,true));
 document.querySelectorAll('[data-kind]').forEach(b=>b.onclick=async()=>{try{await api('/api/sync',{account:current,kind:b.dataset.kind});notice('任务已启动，可稍后刷新查看进度');await refresh()}catch(err){notice(err.message,true)}});

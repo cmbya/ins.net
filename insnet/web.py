@@ -35,9 +35,10 @@ def valid_cookie_file(value):
 class AppServer(ThreadingHTTPServer):
     daemon_threads = True
 
-    def __init__(self, address, db, coordinator, password):
+    def __init__(self, address, db, coordinator, password, archive_root):
         self.db, self.coordinator = db, coordinator
         self.password = password
+        self.archive_root = Path(archive_root).resolve()
         self.secret = secrets.token_bytes(32)
         super().__init__(address, Handler)
 
@@ -102,6 +103,15 @@ class Handler(BaseHTTPRequestHandler):
                 return self.reply(200, self.server.db.posts(query.get("account", [""])[0]))
             if path == "/api/runs":
                 return self.reply(200, self.server.db.runs())
+            if path == "/api/runlogs":
+                run_id = query.get("run", [""])[0]
+                return self.reply(200, self.server.db.run_logs(run_id))
+            if path == "/api/settings":
+                subdir = self.server.db.setting("media_subdir", "Instagram")
+                target = self.server.archive_root / subdir if subdir else self.server.archive_root
+                return self.reply(200, {"media_subdir": subdir,
+                                        "archive_root": str(self.server.archive_root),
+                                        "media_path": str(target)})
             match = re.fullmatch(r"/media/(\d+)/([A-Za-z0-9_-]+)", path)
             if match:
                 return self.serve_media(int(match[1]), match[2])
@@ -171,6 +181,21 @@ class Handler(BaseHTTPRequestHandler):
             if origin and urlparse(origin).netloc != self.headers.get("Host"):
                 return self.reply(403, {"error": "请求来源无效"})
             value = self.body()
+            if path == "/api/settings":
+                raw_subdir = str(value.get("media_subdir", "")).strip()
+                if raw_subdir.startswith("/"):
+                    raise ValueError("请填写 /archive 下的相对路径，例如 Instagram/备份")
+                subdir = raw_subdir.rstrip("/")
+                parts = subdir.split("/") if subdir else []
+                if len(subdir) > 180 or "\\" in subdir or "\x00" in subdir or any(
+                    part in ("", ".", "..") for part in parts
+                ):
+                    raise ValueError("保存目录只能填写 /archive 下的相对路径，不能包含 ..")
+                target = self.server.archive_root / subdir if subdir else self.server.archive_root
+                target.resolve().relative_to(self.server.archive_root)
+                self.server.db.set_setting("media_subdir", subdir)
+                return self.reply(200, {"media_subdir": subdir,
+                                        "media_path": str(target)})
             account_id = str(value.get("account", ""))
             if path == "/api/accounts":
                 name = str(value.get("username", "")).strip().lower().lstrip("@")
@@ -217,13 +242,17 @@ def main():
     if len(password) < 12:
         raise SystemExit("请设置至少 12 位的 INS_PASSWORD")
     root = Path(os.environ.get("INS_DATA", "/data")).resolve()
+    archive_root = Path(os.environ.get("INS_ARCHIVE_ROOT", "/archive")).resolve()
     root.mkdir(parents=True, exist_ok=True)
     (root / "tmp").mkdir(exist_ok=True)
+    archive_root.mkdir(parents=True, exist_ok=True)
     db = Database(root)
-    service = SyncService(db, root, max_posts=int(os.environ.get("INS_MAX_POSTS", "30")))
+    service = SyncService(db, root, max_posts=int(os.environ.get("INS_MAX_POSTS", "20")),
+                          archive_root=archive_root)
     coordinator = Coordinator(db, service, interval_hours=int(os.environ.get("INS_INTERVAL_HOURS", "6")))
     coordinator.schedule()
-    server = AppServer(("0.0.0.0", int(os.environ.get("INS_PORT", "18080"))), db, coordinator, password)
+    server = AppServer(("0.0.0.0", int(os.environ.get("INS_PORT", "18080"))),
+                       db, coordinator, password, archive_root)
     server.serve_forever()
 
 

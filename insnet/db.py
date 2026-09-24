@@ -38,8 +38,18 @@ CREATE TABLE IF NOT EXISTS runs (
     message TEXT NOT NULL DEFAULT '', started_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
     finished_at TEXT
 );
+CREATE TABLE IF NOT EXISTS run_logs (
+    id INTEGER PRIMARY KEY AUTOINCREMENT, run_id TEXT NOT NULL,
+    level TEXT NOT NULL DEFAULT 'INFO', source TEXT NOT NULL DEFAULT '',
+    message TEXT NOT NULL, created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    FOREIGN KEY (run_id) REFERENCES runs(id) ON DELETE CASCADE
+);
+CREATE TABLE IF NOT EXISTS settings (
+    key TEXT PRIMARY KEY, value TEXT NOT NULL
+);
 CREATE INDEX IF NOT EXISTS idx_posts_account_date ON posts(account_id, published_at DESC);
 CREATE INDEX IF NOT EXISTS idx_runs_started ON runs(started_at DESC);
+CREATE INDEX IF NOT EXISTS idx_run_logs_id ON run_logs(run_id, id);
 """
 
 
@@ -185,6 +195,28 @@ class Database:
             c.execute("""UPDATE runs SET status=?,downloaded=?,skipped=?,failed=?,message=?,
                          finished_at=CURRENT_TIMESTAMP WHERE id=?""",
                       (status, counts["downloaded"], counts["skipped"], counts["failed"], message[:2000], run_id))
+
+    def add_run_log(self, run_id, level, source, message):
+        with self.connect() as c:
+            c.execute("INSERT INTO run_logs(run_id,level,source,message) VALUES(?,?,?,?)",
+                      (run_id, str(level)[:10].upper(), str(source)[:100], str(message)[:6000]))
+
+    def run_logs(self, run_id, limit=500):
+        with self.connect() as c:
+            rows = c.execute(
+                "SELECT id,level,source,message,created_at FROM run_logs WHERE run_id=? "
+                "ORDER BY id DESC LIMIT ?", (run_id, min(max(1, int(limit)), 500))).fetchall()
+            return [dict(x) for x in reversed(rows)]
+
+    def setting(self, key, default=""):
+        with self.connect() as c:
+            row = c.execute("SELECT value FROM settings WHERE key=?", (key,)).fetchone()
+            return row["value"] if row else default
+
+    def set_setting(self, key, value):
+        with self.connect() as c:
+            c.execute("INSERT INTO settings(key,value) VALUES(?,?) "
+                      "ON CONFLICT(key) DO UPDATE SET value=excluded.value", (key, value))
 
     def runs(self, limit=30):
         with self.connect() as c:

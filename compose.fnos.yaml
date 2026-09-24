@@ -11,10 +11,12 @@ services:
       - "18080:18080"
     environment:
       INS_PASSWORD: "请在这里改成至少12位的独立密码"
+      INS_ARCHIVE_ROOT: /archive
       INS_INTERVAL_HOURS: "6"
-      INS_MAX_POSTS: "30"
+      INS_MAX_POSTS: "20"
     volumes:
       - insnet-data:/data
+      - /vol2/1000/insnet/archive:/archive
 
 volumes:
   insnet-data:

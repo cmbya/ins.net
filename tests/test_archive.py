@@ -1,9 +1,11 @@
 import tempfile
 import unittest
+from types import SimpleNamespace
 from pathlib import Path
+from unittest.mock import patch
 
 from insnet.db import Database
-from insnet.engine import following_from_messages, normalize_messages
+from insnet.engine import GalleryDL, GalleryError, following_from_messages, normalize_messages
 from insnet.sync import SyncService
 from insnet.web import valid_cookie_file
 
@@ -19,8 +21,10 @@ class FakeGallery:
     def __init__(self):
         self.calls = 0
         self.partial = True
+        self.post_requests = []
 
     def posts(self, cookie, url, max_posts):
+        self.post_requests.append((url, max_posts))
         return normalize_messages(MESSAGES)
 
     def download(self, cookie, post, staging):
@@ -51,7 +55,8 @@ class ArchiveTests(unittest.TestCase):
             account_id = db.add_account("owner", root / "cookies.txt")
             account = db.account(account_id)
             fake = FakeGallery()
-            service = SyncService(db, root, fake)
+            service = SyncService(db, root, fake, archive_root=root / "archive")
+            (root / "archive").mkdir()
             counts, error = service.run(account, "saved")
             self.assertEqual(counts["failed"], 1)
             posts = db.posts(account_id)
@@ -65,10 +70,50 @@ class ArchiveTests(unittest.TestCase):
             self.assertEqual(posts[0]["status"], "complete")
             self.assertEqual(posts[0]["sources"], ["creator:creator:posts", "creator:creator:reels", "saved"])
             self.assertEqual(posts[0]["media"][0]["relative_path"], first)
-            self.assertTrue(all((root / "media" / x["relative_path"]).exists() for x in posts[0]["media"]))
+            self.assertTrue(all((root / "archive" / x["relative_path"]).exists() for x in posts[0]["media"]))
             counts, error = service.run(account, "saved")
             self.assertEqual(counts["skipped"], 1)
             self.assertEqual(fake.calls, 2)
+
+    def test_only_selected_creators_are_scanned_latest_20_or_all(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            (root / "tmp").mkdir()
+            (root / "archive").mkdir()
+            db = Database(root)
+            account_id = db.add_account("owner", root / "cookies.txt")
+            account = db.account(account_id)
+            db.upsert_creator(account_id, "selected", enabled=True)
+            db.upsert_creator(account_id, "not_selected", enabled=False)
+            fake = FakeGallery()
+            service = SyncService(db, root, fake, archive_root=root / "archive")
+            service.run(account, "creators")
+            self.assertEqual(len(fake.post_requests), 2)
+            self.assertTrue(all("selected" in url and "not_selected" not in url for url, _ in fake.post_requests))
+            self.assertTrue(all(limit == 20 for _, limit in fake.post_requests))
+            db.set_creator(account_id, "selected", full_sync=True)
+            service.run(account, "creators")
+            self.assertEqual([limit for _, limit in fake.post_requests[-2:]], [None, None])
+
+    def test_failure_log_contains_diagnostics_and_redacts_cookie(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            cookie = Path(temporary) / "cookies.txt"
+            cookie.write_text(".instagram.com\tTRUE\t/\tTRUE\t0\tsessionid\tsuper_secret_token\n")
+            with patch("insnet.engine.subprocess.run", return_value=SimpleNamespace(
+                returncode=1, stderr="HTTP 401 super_secret_token", stdout="")):
+                with self.assertRaises(GalleryError) as caught:
+                    GalleryDL()._run(cookie, ["https://www.instagram.com/"])
+            self.assertIn("HTTP 401", str(caught.exception))
+            self.assertNotIn("super_secret_token", str(caught.exception))
+
+    def test_run_logs_are_persisted_in_order(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            db = Database(temporary)
+            account_id = db.add_account("owner", Path(temporary) / "cookies.txt")
+            run_id = db.create_run(account_id, "following")
+            db.add_run_log(run_id, "info", "following", "start")
+            db.add_run_log(run_id, "error", "following", "HTTP 401")
+            self.assertEqual([line["message"] for line in db.run_logs(run_id)], ["start", "HTTP 401"])
 
     def test_cookie_requires_instagram_session(self):
         self.assertTrue(valid_cookie_file(".instagram.com\tTRUE\t/\tTRUE\t0\tsessionid\tsecret\n"))
