@@ -445,7 +445,7 @@ class Database:
         return {"items":rows,"total":total,"page":page,"limit":limit}
 
     def hide_records(self, account_id, username=None, ids=None, restore=False):
-        # Soft deletion retains the archive manifest and dedupe tombstone. Never unlink media.
+        # Hide dashboard rows while retaining media paths for next-run file validation. Never unlink media.
         where, args = ["account_id=?"], [account_id]
         if username:
             where.append("username=?"); args.append(username)

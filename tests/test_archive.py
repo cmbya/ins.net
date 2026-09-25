@@ -318,7 +318,7 @@ class ArchiveTests(unittest.TestCase):
             media = db.posts(account["id"])[0]["media"]
             self.assertTrue(all((archive / row["relative_path"]).is_file() for row in media))
 
-    def test_creator_delete_hides_records_but_keeps_media_files_and_dedupe(self):
+    def test_creator_record_clear_hides_records_but_keeps_media_and_manifest(self):
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
             db, account, _, _ = self.setup_service(root)
@@ -343,7 +343,7 @@ class ArchiveTests(unittest.TestCase):
             db.upsert_post(account_id, original, "saved")
             self.assertTrue(db.post(post_id)["deleted_at"])
 
-    def test_hidden_posts_have_separate_count_and_do_not_emit_per_post_skip_logs(self):
+    def test_cleared_post_with_intact_archive_is_skipped_without_restoring_record(self):
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
             original = post("DELETED", username="creator")
@@ -361,14 +361,66 @@ class ArchiveTests(unittest.TestCase):
             service = SyncService(db, root, fake, archive_root=archive)
             counts, error = service.run(account, "creator", log=lambda *entry: logs.append(entry), username="creator")
 
-            self.assertEqual((counts["downloaded"], counts["skipped"], counts["ignored"], counts["failed"]),
-                             (0, 0, 1, 0))
+            self.assertEqual((counts["downloaded"], counts["skipped"], counts["failed"]), (0, 1, 0))
             self.assertEqual(error, "")
-            summary = next(message for _, _, message in logs if message.startswith("已隐藏 1 条："))
-            self.assertIn("保留去重标记，未校验归档文件，也不会重新下载", summary)
-            self.assertFalse(any("跳过 DELETED" in message for _, _, message in logs))
-            self.assertFalse(any(message.startswith("跳过 1 条") for _, _, message in logs))
+            summary = next(message for _, _, message in logs if message.startswith("跳过 1 条："))
+            self.assertIn("其中清除记录后文件仍在 1 条", summary)
             self.assertEqual(fake.calls, 0)
+            self.assertTrue(db.post(post_id)["deleted_at"])
+
+    def test_cleared_post_with_deleted_archive_is_redownloaded_and_record_restored(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            original = post("DELETED", username="creator")
+            db, account, fake, archive = self.setup_service(root, FakeGallery([original]))
+            db.add_creator(account["id"], "creator")
+            post_id = db.upsert_post(account["id"], original, "creator:creator:posts")
+            marker = archive / "creator" / "deleted.jpg"
+            marker.parent.mkdir(parents=True)
+            marker.write_bytes(b"archive")
+            db.set_media_file(post_id, original["items"][0]["media_id"], "creator/deleted.jpg", 7, "jpg")
+            db.set_post_status(post_id, "complete")
+            db.hide_records(account["id"], username="creator")
+            marker.unlink()
+
+            service = SyncService(db, root, fake, archive_root=archive)
+            counts, error = service.run(account, "creator", username="creator")
+
+            self.assertEqual((counts["downloaded"], counts["skipped"], counts["failed"]), (1, 0, 0))
+            self.assertEqual(error, "")
+            self.assertEqual(fake.calls, 1)
+            self.assertIsNone(db.post(post_id)["deleted_at"])
+            self.assertEqual(db.records({"account": account["id"], "deleted": "0"})["total"], 1)
+            media = db.post_media(post_id)[0]
+            self.assertTrue((archive / media["relative_path"]).is_file())
+
+    def test_cleared_carousel_downloads_only_media_removed_from_disk(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            original = post("CAROUSEL", username="creator", media_count=2)
+            db, account, fake, archive = self.setup_service(root, FakeGallery([original]))
+            db.add_creator(account["id"], "creator")
+            post_id = db.upsert_post(account["id"], original, "creator:creator:posts")
+            kept = archive / "creator" / "kept.jpg"
+            removed = archive / "creator" / "removed.jpg"
+            kept.parent.mkdir(parents=True)
+            kept.write_bytes(b"kept carousel image")
+            removed.write_bytes(b"removed carousel image")
+            db.set_media_file(post_id, "CAROUSEL-1", "creator/kept.jpg", kept.stat().st_size, "jpg")
+            db.set_media_file(post_id, "CAROUSEL-2", "creator/removed.jpg", removed.stat().st_size, "jpg")
+            db.set_post_status(post_id, "complete")
+            db.hide_records(account["id"], username="creator")
+            removed.unlink()
+
+            service = SyncService(db, root, fake, archive_root=archive)
+            counts, error = service.run(account, "creator", username="creator")
+
+            self.assertEqual((counts["downloaded"], counts["skipped"], counts["failed"]), (1, 0, 0))
+            self.assertEqual(error, "")
+            self.assertEqual(fake.download_requests, [{"CAROUSEL-2"}])
+            self.assertTrue(kept.is_file())
+            self.assertIsNone(db.post(post_id)["deleted_at"])
+            self.assertEqual(db.records({"account": account["id"], "deleted": "0"})["total"], 1)
 
     def test_removing_creator_from_list_keeps_posts_and_file_relations(self):
         with tempfile.TemporaryDirectory() as temporary:

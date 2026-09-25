@@ -75,9 +75,6 @@ class SyncService:
 
     def _archive(self, account, post, source, log=None):
         post_id = self.db.upsert_post(account["id"], post, source)
-        if self.db.post(post_id).get("deleted_at"):
-            self._log(log, "INFO", source, f"跳过 {post['shortcode']}：记录已删除，保留去重标记")
-            return "skipped"
         rows = self.db.post_media(post_id)
         for row in rows:
             self._restore_legacy_media(post_id, row, log)
@@ -168,35 +165,39 @@ class SyncService:
                                   for row in rows)
 
     def _download_batch(self, account, source, posts, max_per_run=None, log=None):
-        counts = {"downloaded": 0, "skipped": 0, "ignored": 0, "failed": 0}
+        counts = {"downloaded": 0, "skipped": 0, "failed": 0}
         attempts = 0
         scanned_skips = 0
+        cleared_file_skips = 0
         for post in posts:
             stored = self.db.post(post['id'])
-            if stored and stored.get('deleted_at'):
-                counts['ignored'] += 1
-                continue
-            if post.get("status") == "complete" and not post.get("scanned_this_run"):
+            was_cleared = bool(stored and stored.get("deleted_at"))
+            if not was_cleared and post.get("status") == "complete" and not post.get("scanned_this_run"):
                 counts["skipped"] += 1
                 continue
             if self._locally_complete(post, source, log):
                 self.db.set_post_status(post["id"], "complete")
                 counts["skipped"] += 1
                 scanned_skips += bool(post.get("scanned_this_run"))
+                cleared_file_skips += bool(was_cleared)
                 continue
             if max_per_run is not None and attempts >= max_per_run:
                 continue
+            if was_cleared:
+                # A cleared record is only hidden while its files remain intact.
+                # If files were removed, make the retry visible and archive them again.
+                self.db.hide_records(account["id"], ids=[int(post["id"])], restore=True)
+                self._log(log, "INFO", source,
+                          f"恢复 {post['shortcode']} 的作品记录：本地媒体缺失，将重新下载缺少的项目")
             attempts += 1
             result = self._archive(account, post, source, log)
             counts[result] += 1
         if counts["skipped"]:
             self._log(log, "INFO", source,
-                      f"跳过 {counts['skipped']} 条已同步记录：本轮扫描并验证文件完整 {scanned_skips} 条，"
-                      f"已有完整状态但本轮未扫描 {counts['skipped'] - scanned_skips} 条")
-        if counts["ignored"]:
-            self._log(log, "INFO", source,
-                      f"已隐藏 {counts['ignored']} 条：保留去重标记，未校验归档文件，也不会重新下载")
-        queued = max(0, len(posts) - attempts - counts["skipped"] - counts["ignored"])
+                      f"跳过 {counts['skipped']} 条：本轮扫描且归档文件完整 {scanned_skips} 条，"
+                      f"其中清除记录后文件仍在 {cleared_file_skips} 条；未扫描的完整状态记录 "
+                      f"{counts['skipped'] - scanned_skips} 条")
+        queued = max(0, len(posts) - attempts - counts["skipped"])
         if queued:
             self._log(log, "INFO", source,
                       f"达到本轮下载上限；还有 {queued} 条待下载，将在后续同步继续")
@@ -276,7 +277,7 @@ class SyncService:
         return counts
 
     def run(self, account, kind, log=None, username=None):
-        counts = {"downloaded": 0, "skipped": 0, "ignored": 0, "failed": 0}
+        counts = {"downloaded": 0, "skipped": 0, "failed": 0}
         error = ""
         rate_limited = False
         if kind == "creator":
@@ -300,8 +301,7 @@ class SyncService:
         else:
             raise ValueError("未知同步任务")
         self._log(log, "INFO", kind,
-                  f"本任务结束：下载 {counts['downloaded']}，跳过 {counts['skipped']}，"
-                  f"已隐藏 {counts['ignored']}，失败 {counts['failed']}")
+                  f"本任务结束：下载 {counts['downloaded']}，跳过 {counts['skipped']}，失败 {counts['failed']}")
         return counts, error
 
 
@@ -344,7 +344,7 @@ class Coordinator:
                 self.active.discard(account_id)
             if run_id:
                 try:
-                    self.db.finish_run(run_id, "failed", {"downloaded": 0, "skipped": 0, "ignored": 0, "failed": 1},
+                    self.db.finish_run(run_id, "failed", {"downloaded": 0, "skipped": 0, "failed": 1},
                                        f"任务启动失败：{type(exc).__name__}: {exc}")
                     self.db.add_run_log(run_id, "ERROR", run_kind, f"任务启动失败：{exc}")
                 except Exception:
@@ -353,7 +353,7 @@ class Coordinator:
         return run_id
 
     def _execute(self, run_id, account, kind, username=None):
-        counts = {"downloaded": 0, "skipped": 0, "ignored": 0, "failed": 0}
+        counts = {"downloaded": 0, "skipped": 0, "failed": 0}
         log = lambda level, source, message: self.db.add_run_log(run_id, level, source, message)
         try:
             label = f"@{username}" if kind == "creator" else "授权检测"

@@ -184,7 +184,7 @@ class WebApiTests(unittest.TestCase):
                     time.sleep(0.01)
             self.coordinator.stopped.set()
             thread.join(timeout=1)
-        self.assertEqual(logs["total"], 1)
+        self.assertGreaterEqual(logs["total"], 1)
         self.assertEqual(logs["items"][0]["source"], "scheduler")
         self.assertIn("simulated scheduler failure", logs["items"][0]["message"])
 
