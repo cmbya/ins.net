@@ -9,6 +9,9 @@ services:
     environment:
       INS_PASSWORD: ${INS_PASSWORD:?在 .env 中设置至少 12 位的管理密码}
       INS_ARCHIVE_ROOT: /archive
+      INS_UID: ${INS_UID:-10001}
+      INS_GID: ${INS_GID:-10001}
+      INS_COOKIE_SECURE: ${INS_COOKIE_SECURE:-0}
     volumes:
       - ./data:/data
       - ./archive:/archive

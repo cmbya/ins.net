@@ -3,11 +3,13 @@
 import hashlib
 import hmac
 import json
+from collections import deque
 import mimetypes
 import os
 import re
 import secrets
 import sqlite3
+import threading
 import time
 from http import cookies
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -21,7 +23,7 @@ from .sync import Coordinator, SyncService
 
 
 STATIC = Path(__file__).resolve().parent.parent / "static"
-APP_VERSION = "0.6.0"
+APP_VERSION = "0.7.0"
 
 
 def valid_cookie_file(value):
@@ -45,7 +47,42 @@ class AppServer(ThreadingHTTPServer):
         self.password = password
         self.archive_root = Path(archive_root).resolve()
         self.secret = secrets.token_bytes(32)
+        self.cookie_secure = os.environ.get("INS_COOKIE_SECURE", "0") == "1"
+        self._login_lock = threading.Lock()
+        self._login_failures = {}
         super().__init__(address, Handler)
+
+    def login_retry_after(self, client):
+        now = time.monotonic()
+        with self._login_lock:
+            attempts = self._login_failures.get(client)
+            if not attempts:
+                return 0
+            while attempts and now - attempts[0] >= 900:
+                attempts.popleft()
+            if not attempts:
+                self._login_failures.pop(client, None)
+                return 0
+            return max(1, int(900 - (now - attempts[0]))) if len(attempts) >= 10 else 0
+
+    def record_login_failure(self, client):
+        now = time.monotonic()
+        with self._login_lock:
+            if client not in self._login_failures and len(self._login_failures) >= 2048:
+                expired = [key for key, values in self._login_failures.items()
+                           if not values or now - values[-1] >= 900]
+                for key in expired:
+                    self._login_failures.pop(key, None)
+                if len(self._login_failures) >= 2048:
+                    self._login_failures.pop(next(iter(self._login_failures)))
+            attempts = self._login_failures.setdefault(client, deque())
+            while attempts and now - attempts[0] >= 900:
+                attempts.popleft()
+            attempts.append(now)
+
+    def clear_login_failures(self, client):
+        with self._login_lock:
+            self._login_failures.pop(client, None)
 
 
 class Handler(BaseHTTPRequestHandler):
@@ -55,13 +92,15 @@ class Handler(BaseHTTPRequestHandler):
         # URLs can include user identifiers; avoid logging API payloads.
         pass
 
-    def reply(self, code, data):
+    def reply(self, code, data, headers=None):
         body = json.dumps(data, ensure_ascii=False).encode()
         self.send_response(code)
         self.send_header("Content-Type", "application/json; charset=utf-8")
         self.send_header("Content-Length", str(len(body)))
         self.send_header("Cache-Control", "no-store")
         self.send_header("X-Content-Type-Options", "nosniff")
+        for name, value in (headers or {}).items():
+            self.send_header(name, str(value))
         self.end_headers()
         self.wfile.write(body)
 
@@ -178,13 +217,22 @@ class Handler(BaseHTTPRequestHandler):
         path = urlparse(self.path).path
         try:
             if path == "/api/login":
+                client = self.client_address[0]
+                retry_after = self.server.login_retry_after(client)
+                if retry_after:
+                    return self.reply(429, {"error": "登录尝试过多，请稍后再试"},
+                                      {"Retry-After": retry_after})
                 value = self.body()
-                if not hmac.compare_digest(str(value.get("password", "")), self.server.password):
+                candidate = value.get("password", "") if isinstance(value, dict) else ""
+                if not hmac.compare_digest(str(candidate), self.server.password):
+                    self.server.record_login_failure(client)
                     return self.reply(401, {"error": "密码错误"})
+                self.server.clear_login_failures(client)
                 timestamp = str(int(time.time()))
                 signature = hmac.new(self.server.secret, timestamp.encode(), hashlib.sha256).hexdigest()
                 self.send_response(200)
-                self.send_header("Set-Cookie", f"insnet_session={timestamp}.{signature}; HttpOnly; SameSite=Strict; Path=/")
+                secure = "; Secure" if self.server.cookie_secure else ""
+                self.send_header("Set-Cookie", f"insnet_session={timestamp}.{signature}; HttpOnly; SameSite=Strict; Path=/{secure}")
                 self.send_header("Content-Type", "application/json")
                 self.send_header("Content-Length", "2")
                 self.end_headers()
@@ -290,6 +338,7 @@ def main():
     (root / "tmp").mkdir(exist_ok=True)
     archive_root.mkdir(parents=True, exist_ok=True)
     db = Database(root)
+    db.recover_interrupted_runs()
     service = SyncService(db, root, archive_root=archive_root)
     coordinator = Coordinator(db, service)
     coordinator.schedule()

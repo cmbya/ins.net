@@ -1,5 +1,6 @@
 """Scheduled and on-demand Instagram archiving."""
 
+import logging
 import os
 import re
 import shutil
@@ -51,11 +52,11 @@ class SyncService:
                 return
             archived = (self.archive_root / relative).resolve()
             archived.relative_to(self.archive_root.resolve())
-            if self._file_is_complete(archived):
+            if self._file_is_complete(archived, row.get("size", 0)):
                 return
             legacy = (legacy_root / relative).resolve()
             legacy.relative_to(legacy_root)
-            if not legacy.is_file():
+            if not self._file_is_complete(legacy, row.get("size", 0)):
                 return
             subdir = self.db.setting("media_subdir", "Instagram").strip("/")
             prefix = Path(subdir) if subdir else Path()
@@ -82,7 +83,7 @@ class SyncService:
             self._restore_legacy_media(post_id, row, log)
         rows = self.db.post_media(post_id)
         missing = [row for row in rows if not row["relative_path"] or not
-                   self._file_is_complete(self.archive_root / row["relative_path"])]
+                   self._file_is_complete(self.archive_root / row["relative_path"], row.get("size", 0))]
         if not missing:
             self.db.set_post_status(post_id, "complete")
             self._log(log, "INFO", source, f"跳过 @{post['username']}/{post['shortcode']}：文件已经完整")
@@ -95,7 +96,8 @@ class SyncService:
                   f"下载 @{post['username']}/{post['shortcode']}：缺少 {len(missing)} 个媒体项")
         try:
             with TemporaryDirectory(dir=self.root / "tmp") as temporary:
-                files = self.gallery.download(account["cookie_path"], post, temporary)
+                files = self.gallery.download(account["cookie_path"], post, temporary,
+                                              media_ids=[row["media_id"] for row in missing])
                 for row in missing:
                     candidate = files.get(row["media_id"])
                     if not candidate:
@@ -111,7 +113,7 @@ class SyncService:
                     replace_from_staging(candidate, target)
                     self.db.set_media_file(post_id, row["media_id"], str(relative / filename), size, extension)
             remaining = [r for r in self.db.post_media(post_id) if not r["relative_path"] or not
-                         self._file_is_complete(self.archive_root / r["relative_path"])]
+                         self._file_is_complete(self.archive_root / r["relative_path"], r.get("size", 0))]
             if remaining:
                 self.db.set_post_status(post_id, "partial", f"缺少 {len(remaining)} 个媒体文件")
                 self._log(log, "ERROR", source,
@@ -127,9 +129,12 @@ class SyncService:
             return "failed"
 
     @staticmethod
-    def _file_is_complete(path):
+    def _file_is_complete(path, expected_size=0):
         try:
-            return Path(path).is_file() and Path(path).stat().st_size > 0
+            if not Path(path).is_file():
+                return False
+            actual_size = Path(path).stat().st_size
+            return actual_size > 0 and (int(expected_size or 0) <= 0 or actual_size == int(expected_size))
         except OSError:
             return False
 
@@ -159,7 +164,7 @@ class SyncService:
             self._restore_legacy_media(post_id, row, log)
         rows = self.db.post_media(post_id)
         return bool(rows) and all(row["relative_path"] and
-                                  self._file_is_complete(self.archive_root / row["relative_path"])
+                                  self._file_is_complete(self.archive_root / row["relative_path"], row.get("size", 0))
                                   for row in rows)
 
     def _download_batch(self, account, source, posts, max_per_run=None, log=None):
@@ -206,6 +211,9 @@ class SyncService:
         max_per_run = int(creator["max_per_run"])
         self._log(log, "INFO", source,
                   f"开始同步 @{name}：{'最新 20 条' if mode == 'recent20' else '全部历史分批扫描'}，本轮最多下载 {max_per_run} 条")
+        # Snapshot the unfinished queue before the new metadata scan inserts its
+        # discoveries. This lets the batch finish queued work before extending it.
+        backlog = self.db.creator_pending_posts(account_id, name)
         recent, _ = self._scan(account, url, 20)
         self._persist_scan(account, recent, source, name)
         self._log(log, "INFO", source, f"最新内容读取完成：{len(recent)} 条帖子")
@@ -228,15 +236,43 @@ class SyncService:
         # Current page and persisted backlog are merged by shortcode. Complete
         # records are cheap skips; pending items precede partial failures so one
         # repeatedly failing post cannot block an entire history archive.
-        backlog = self.db.creator_pending_posts(account_id, name) if mode == "all" else []
-        by_shortcode = {post["shortcode"]: post for post in backlog}
+        # Keep discovered but unfinished posts queued even after newer posts push
+        # them out of the recent-20 feed.
+        by_shortcode = {post["shortcode"]: {**post, "queued_before_run": True} for post in backlog}
         for post in scanned:
-            by_shortcode[post["shortcode"]] = post
+            if post["shortcode"] not in by_shortcode:
+                by_shortcode[post["shortcode"]] = {**post, "queued_before_run": False}
+
+        # Check a bounded page of complete records every run. This catches files
+        # removed or truncated on disk, even when the post is outside recent20.
+        verify_cursor = int(creator.get("verify_cursor") or 0)
+        archived = self.db.creator_complete_posts(account_id, name, verify_cursor, limit=50)
+        if not archived and verify_cursor:
+            verify_cursor = 0
+            archived = self.db.creator_complete_posts(account_id, name, 0, limit=50)
+        repaired_candidates = 0
+        for post in archived:
+            if not self._locally_complete(post, source, log):
+                self.db.set_post_status(post["id"], "partial", "归档文件缺失或大小与记录不一致")
+                post["status"] = "partial"
+                post["scanned_this_run"] = False
+                post["queued_before_run"] = True
+                by_shortcode[post["shortcode"]] = post
+                repaired_candidates += 1
+        next_verify_cursor = archived[-1]["id"] if len(archived) == 50 else 0
+        self.db.update_creator_verify_cursor(account_id, name, next_verify_cursor)
+        self._log(log, "INFO", source,
+                  f"归档完整性抽查 {len(archived)} 条；发现需补齐 {repaired_candidates} 条")
+
         candidates = list(by_shortcode.values())
-        candidates.sort(key=lambda p: p.get("published_at") or "", reverse=True)
-        # Partial failures follow pending items; an old failure cannot starve
-        # the remaining history backlog.
-        candidates.sort(key=lambda p: p.get("status") == "partial")
+        # Process older queue entries first, preserving discovery order within
+        # each queue. New discoveries are appended after existing pending work;
+        # partial failures follow pending items so one failed post cannot starve.
+        candidates.sort(key=lambda p: (
+            0 if p.get("queued_before_run") and p.get("status") != "partial" else
+            1 if p.get("queued_before_run") else 2,
+            int(p.get("id") or 0),
+        ))
         counts = self._download_batch(account, source, candidates, max_per_run, log)
         return counts
 
@@ -246,8 +282,8 @@ class SyncService:
         rate_limited = False
         if kind == "creator":
             creator = self.db.creator(account["id"], username or "")
-            if not creator:
-                raise ValueError("博主不存在")
+            if not creator or int(creator.get("manual", 0)) != 1:
+                raise ValueError("博主不存在或已移出监控列表")
             source = f"creator:{creator['username']}:posts"
             try:
                 counts = self._run_creator(account, creator, log)
@@ -289,16 +325,31 @@ class Coordinator:
             raise ValueError("账号同步已暂停，请先启用")
         if kind == "creator":
             creator = self.db.creator(account_id, username or "")
-            if not creator or not creator.get("manual"):
+            if not creator or int(creator.get("manual", 0)) != 1:
                 raise ValueError("博主不存在或已移出监控列表")
         with self.lock:
             if account_id in self.active:
                 raise ValueError("该账号有任务正在运行")
             self.active.add(account_id)
-            run_kind = f"creator:@{username}" if kind == "creator" else "authorization-check"
+        run_id = None
+        run_kind = f"creator:@{username}" if kind == "creator" else "authorization-check"
+        try:
             run_id = self.db.create_run(account_id, run_kind)
             self.db.add_run_log(run_id, "INFO", run_kind, "任务已创建，等待执行")
-        threading.Thread(target=self._execute, args=(run_id, account, kind, username), daemon=True).start()
+            worker = threading.Thread(target=self._execute,
+                                      args=(run_id, account, kind, username), daemon=True)
+            worker.start()
+        except Exception as exc:
+            with self.lock:
+                self.active.discard(account_id)
+            if run_id:
+                try:
+                    self.db.finish_run(run_id, "failed", {"downloaded": 0, "skipped": 0, "failed": 1},
+                                       f"任务启动失败：{type(exc).__name__}: {exc}")
+                    self.db.add_run_log(run_id, "ERROR", run_kind, f"任务启动失败：{exc}")
+                except Exception:
+                    logging.exception("failed to persist task startup error")
+            raise
         return run_id
 
     def _execute(self, run_id, account, kind, username=None):
@@ -330,24 +381,35 @@ class Coordinator:
                 self.active.discard(account["id"])
 
     def schedule(self):
+        def record_error(message):
+            try:
+                self.db.add_system_event("ERROR", "scheduler", message)
+            except Exception:
+                logging.exception("failed to persist scheduler error: %s", message)
+
         def loop():
             while not self.stopped.is_set():
-                self.db.purge_old_logs()
-                if self.db.setting('scheduler_enabled','1') != '1':
-                    self.stopped.wait(self.poll_interval)
-                    continue
-                for account in self.db.accounts():
-                    account_id = account["id"]
-                    if not account.get('enabled',1):
-                        continue
-                    with self.lock:
-                        if account_id in self.active:
-                            continue
-                    try:
-                        creator = self.db.due_creators(account_id)
-                        if creator:
-                            self.start(account_id, "creator", creator["username"])
-                    except Exception:
-                        pass
+                try:
+                    self.db.purge_old_logs()
+                    if self.db.setting('scheduler_enabled','1') == '1':
+                        for account in self.db.accounts():
+                            account_id = account["id"]
+                            if not account.get('enabled',1):
+                                continue
+                            with self.lock:
+                                if account_id in self.active:
+                                    continue
+                            try:
+                                creator = self.db.due_creators(account_id)
+                                if creator:
+                                    self.start(account_id, "creator", creator["username"])
+                            except Exception as exc:
+                                record_error(f"账号 {account.get('username', account_id)} 的调度失败："
+                                             f"{type(exc).__name__}: {exc}")
+                except Exception as exc:
+                    message = f"调度循环异常：{type(exc).__name__}: {exc}"
+                    record_error(message)
                 self.stopped.wait(self.poll_interval)
-        threading.Thread(target=loop, daemon=True).start()
+        self.scheduler_thread = threading.Thread(target=loop, daemon=True)
+        self.scheduler_thread.start()
+        return self.scheduler_thread

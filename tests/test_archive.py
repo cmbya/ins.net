@@ -9,6 +9,7 @@ from types import SimpleNamespace
 from unittest.mock import patch
 
 from insnet.db import Database
+from insnet.entrypoint import _check_archive_access
 from insnet.engine import GalleryDL, GalleryError, normalize_messages, redact_output
 from insnet.sync import Coordinator, SyncService
 from insnet.web import valid_cookie_file
@@ -49,6 +50,7 @@ class FakeGallery:
         self.post_requests = []
         self.scan_requests = []
         self.history_responses = {}
+        self.download_requests = []
 
     def posts(self, cookie, url, max_posts):
         self.post_requests.append((url, max_posts))
@@ -61,10 +63,14 @@ class FakeGallery:
             return list(self.posts_data[:20]), None
         return self.history_responses.get(cursor, ([], None))
 
-    def download(self, cookie, item, staging):
+    def download(self, cookie, item, staging, media_ids=None):
         self.calls += 1
+        selected = set(media_ids or [media["media_id"] for media in item["items"]])
+        self.download_requests.append(selected)
         path = Path(staging)
         for media in item["items"]:
+            if media["media_id"] not in selected:
+                continue
             if self.partial and media["position"] > 1:
                 continue
             (path / f"{media['media_id']}.jpg").write_bytes(b"image:" + media["media_id"].encode())
@@ -79,6 +85,16 @@ class ArchiveTests(unittest.TestCase):
         db = Database(root)
         account_id = db.add_account("owner", root / "cookies.txt")
         return db, db.account(account_id), fake or FakeGallery(), archive
+
+    def test_archive_access_check_preserves_host_folder_owner_and_mode(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            archive = Path(temporary)
+            before = archive.stat()
+            _check_archive_access(archive)
+            after = archive.stat()
+            self.assertEqual((before.st_uid, before.st_gid, before.st_mode),
+                             (after.st_uid, after.st_gid, after.st_mode))
+            self.assertFalse(any(path.name.startswith(".insnet-write-test-") for path in archive.iterdir()))
 
     def test_gallery_messages_keep_carousel_and_creator_profile(self):
         posts = normalize_messages(MESSAGES)
@@ -169,6 +185,74 @@ class ArchiveTests(unittest.TestCase):
             self.assertEqual(repaired["downloaded"], 1)
             self.assertTrue(missing.is_file())
             self.assertEqual(fake.calls, 2)
+
+    def test_recent20_continues_already_queued_posts_before_new_feed(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            old = [post(f"OLD{i:02d}", date=f"2026-08-{(i % 28) + 1:02d}") for i in range(20)]
+            db, account, fake, archive = self.setup_service(root, FakeGallery(old))
+            db.add_creator(account["id"], "creator")
+            db.save_admin_config({"creator_interval":360,"creator_max":1,"scheduler_enabled":1,"log_days":30})
+            service = SyncService(db, root, fake, archive_root=archive)
+            first, _ = service.run(account, "creator", username="creator")
+            self.assertEqual(first["downloaded"], 1)
+
+            fake.posts_data = [post(f"NEW{i:02d}", date=f"2026-09-{(i % 28) + 1:02d}") for i in range(20)]
+            second, _ = service.run(account, "creator", username="creator")
+            self.assertEqual(second["downloaded"], 1)
+            self.assertTrue(next(iter(fake.download_requests[-1])).startswith("OLD"))
+            self.assertEqual(len(db.posts(account["id"])), 40)
+            self.assertEqual(sum(row["status"] == "pending" for row in db.posts(account["id"])), 38)
+
+    def test_truncated_archive_is_redownloaded_using_manifest_size(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            db, account, fake, archive = self.setup_service(root)
+            db.add_creator(account["id"], "creator")
+            service = SyncService(db, root, fake, archive_root=archive)
+            first, _ = service.run(account, "creator", username="creator")
+            self.assertEqual(first["downloaded"], 1)
+            media = db.posts(account["id"])[0]["media"][0]
+            target = archive / media["relative_path"]
+            expected = target.stat().st_size
+            target.write_bytes(b"x")
+            self.assertNotEqual(target.stat().st_size, expected)
+
+            repaired, _ = service.run(account, "creator", username="creator")
+            self.assertEqual(repaired["downloaded"], 1)
+            self.assertEqual(target.stat().st_size, expected)
+            self.assertEqual(fake.download_requests[-1], {media["media_id"]})
+
+    def test_integrity_audit_repairs_archived_post_outside_recent_feed(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            older = post("OLDARCHIVE", date="2024-01-01")
+            db, account, fake, archive = self.setup_service(root, FakeGallery([post("NEWFEED")]))
+            db.add_creator(account["id"], "creator")
+            post_id = db.upsert_post(account["id"], older, "creator:creator:posts")
+            target = archive / "old" / "image.jpg"
+            target.parent.mkdir(parents=True)
+            target.write_bytes(b"complete-file")
+            db.set_media_file(post_id, older["items"][0]["media_id"], "old/image.jpg", target.stat().st_size, "jpg")
+            db.set_post_status(post_id, "complete")
+            target.unlink()
+
+            service = SyncService(db, root, fake, archive_root=archive)
+            counts, _ = service.run(account, "creator", username="creator")
+            record = next(p for p in db.posts(account["id"]) if p["shortcode"] == "OLDARCHIVE")
+            self.assertEqual(counts["downloaded"], 2)
+            self.assertEqual(record["status"], "complete")
+            self.assertTrue((archive / record["media"][0]["relative_path"]).is_file())
+
+    def test_media_download_filter_selects_only_missing_carousel_item(self):
+        gallery = GalleryDL()
+        with tempfile.TemporaryDirectory() as temporary:
+            staging = Path(temporary)
+            with patch.object(gallery, "_run", return_value="") as run:
+                gallery.download("cookies.txt", post("CAROUSEL"), staging, media_ids=["CAROUSEL-2"])
+            args = run.call_args.args[1]
+            self.assertEqual(args[0:2], ["--filter", "media_id in ('CAROUSEL-2',)"])
+            self.assertIn("https://www.instagram.com/p/CAROUSEL/", args)
 
     def test_all_history_cursor_advances_in_bounded_batches(self):
         with tempfile.TemporaryDirectory() as temporary:

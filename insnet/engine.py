@@ -143,9 +143,14 @@ class GalleryDL:
         next_cursor = matches[-1] if matches else None
         return normalize_messages(messages), next_cursor
 
-    def download(self, cookie_path, post, staging):
+    def download(self, cookie_path, post, staging, media_ids=None):
         staging = Path(staging)
         staging.mkdir(parents=True, exist_ok=True)
-        self._run(cookie_path, ["--no-mtime", "-D", str(staging), "-f",
-                                 "{media_id}.{extension}", post["source_url"]])
+        args = ["--no-mtime", "-D", str(staging), "-f",
+                "{media_id}.{extension}", post["source_url"]]
+        if media_ids:
+            # IDs have already been normalized to [A-Za-z0-9_-], and repr
+            # makes the tuple a valid, safely quoted gallery-dl expression.
+            args[0:0] = ["--filter", f"media_id in {tuple(media_ids)!r}"]
+        self._run(cookie_path, args)
         return {p.stem: p for p in staging.iterdir() if p.is_file() and p.stat().st_size > 0}

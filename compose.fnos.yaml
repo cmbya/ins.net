@@ -12,6 +12,9 @@ services:
     environment:
       INS_PASSWORD: "请在这里改成至少12位的独立密码"
       INS_ARCHIVE_ROOT: /archive
+      INS_UID: "10001"
+      INS_GID: "10001"
+      INS_COOKIE_SECURE: "0"
     volumes:
       - insnet-data:/data
       - /vol2/1000/docker/INS/insnet:/archive

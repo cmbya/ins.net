@@ -1,9 +1,12 @@
 import json
 import tempfile
 import threading
+import time
 import unittest
 from pathlib import Path
+from urllib.error import HTTPError
 from urllib.request import Request, urlopen
+from unittest.mock import patch
 
 from insnet.db import Database
 from insnet.sync import Coordinator, SyncService
@@ -145,6 +148,76 @@ class WebApiTests(unittest.TestCase):
         with self.assertRaises(ValueError):
             self.coordinator.start(self.account_id, "saved")
         self.assertEqual(self.db.post(post_id)["status"], "complete")
+
+    def test_legacy_reel_only_rows_do_not_appear_in_post_statistics(self):
+        self.db.add_creator(self.account_id, "nasa")
+        reel = {"shortcode":"LEGREEL", "username":"nasa", "caption":"Legacy reel",
+                "published_at":"2026-09-20T12:00:00", "source_url":"https://www.instagram.com/reel/LEGREEL/",
+                "items":[{"media_id":"r101", "position":1, "kind":"video", "extension":"mp4"}]}
+        post_id = self.db.upsert_post(self.account_id, reel, "creator:nasa:reels")
+        self.db.set_post_status(post_id, "complete")
+        self.assertEqual(self.db.dashboard(self.account_id)["total"], 0)
+        self.assertEqual(self.db.records({"account":self.account_id})["total"], 0)
+        self.assertEqual(self.db.creators(self.account_id)[0]["archived_count"], 0)
+
+    def test_removed_creator_cannot_be_started_by_direct_sync_request(self):
+        self.db.add_creator(self.account_id, "nasa")
+        self.db.delete_creator(self.account_id, "nasa")
+        with self.assertRaisesRegex(ValueError, "移出监控列表"):
+            self.coordinator.start(self.account_id, "creator", "nasa")
+        with self.assertRaisesRegex(ValueError, "移出监控列表"):
+            self.service.run(self.account, "creator", username="nasa")
+
+    def test_interrupted_runs_and_scheduler_errors_are_visible_in_system_logs(self):
+        run_id = self.db.create_run(self.account_id, "creator:@nasa")
+        self.db.add_run_log(run_id, "INFO", "creator:nasa:posts", "started")
+        self.assertEqual(self.db.recover_interrupted_runs(), 1)
+        self.assertEqual(self.db.runs()[0]["status"], "interrupted")
+        self.coordinator.poll_interval = 0.01
+        with patch.object(self.db, "purge_old_logs", side_effect=RuntimeError("simulated scheduler failure")):
+            thread = self.coordinator.schedule()
+            deadline = time.monotonic() + 2
+            logs = {"total": 0}
+            while time.monotonic() < deadline and not logs["total"]:
+                logs = self.db.system_logs({"q":"simulated scheduler failure"})
+                if not logs["total"]:
+                    time.sleep(0.01)
+            self.coordinator.stopped.set()
+            thread.join(timeout=1)
+        self.assertEqual(logs["total"], 1)
+        self.assertEqual(logs["items"][0]["source"], "scheduler")
+        self.assertIn("simulated scheduler failure", logs["items"][0]["message"])
+
+    def test_coordinator_releases_active_flag_when_worker_cannot_start(self):
+        self.db.add_creator(self.account_id, "nasa")
+        with patch("insnet.sync.threading.Thread.start", side_effect=RuntimeError("thread unavailable")):
+            with self.assertRaisesRegex(RuntimeError, "thread unavailable"):
+                self.coordinator.start(self.account_id, "creator", "nasa")
+        self.assertNotIn(self.account_id, self.coordinator.active)
+        self.assertEqual(self.db.runs()[0]["status"], "failed")
+
+    def test_login_rate_limit_returns_retry_after(self):
+        for _ in range(10):
+            with self.assertRaises(HTTPError) as error:
+                urlopen(Request(self.base + "/api/login", data=json.dumps(
+                    {"password": "wrong-password"}).encode(),
+                    headers={"Content-Type": "application/json"}, method="POST"))
+            self.assertEqual(error.exception.code, 401)
+            error.exception.close()
+        with self.assertRaises(HTTPError) as error:
+            urlopen(Request(self.base + "/api/login", data=json.dumps(
+                {"password": "wrong-password"}).encode(),
+                headers={"Content-Type": "application/json"}, method="POST"))
+        self.assertEqual(error.exception.code, 429)
+        self.assertGreater(int(error.exception.headers["Retry-After"]), 0)
+        error.exception.close()
+
+    def test_login_cookie_can_be_marked_secure_for_https_proxy(self):
+        self.server.cookie_secure = True
+        response = urlopen(Request(self.base + "/api/login", data=json.dumps(
+            {"password": "test-management-password"}).encode(),
+            headers={"Content-Type": "application/json"}, method="POST"))
+        self.assertIn("; Secure", response.headers["Set-Cookie"])
 
     def test_invalid_settings_do_not_change_archive_directory(self):
         code, before = self.request_json("/api/settings")

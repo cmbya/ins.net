@@ -49,12 +49,18 @@ CREATE TABLE IF NOT EXISTS run_logs (
     message TEXT NOT NULL, created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
     FOREIGN KEY (run_id) REFERENCES runs(id) ON DELETE CASCADE
 );
+CREATE TABLE IF NOT EXISTS system_events (
+    id INTEGER PRIMARY KEY AUTOINCREMENT, level TEXT NOT NULL DEFAULT 'ERROR',
+    source TEXT NOT NULL DEFAULT 'scheduler', message TEXT NOT NULL,
+    created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+);
 CREATE TABLE IF NOT EXISTS settings (
     key TEXT PRIMARY KEY, value TEXT NOT NULL
 );
 CREATE INDEX IF NOT EXISTS idx_posts_account_date ON posts(account_id, published_at DESC);
 CREATE INDEX IF NOT EXISTS idx_runs_started ON runs(started_at DESC);
 CREATE INDEX IF NOT EXISTS idx_run_logs_id ON run_logs(run_id, id);
+CREATE INDEX IF NOT EXISTS idx_system_events_created ON system_events(created_at DESC, id DESC);
 """
 
 
@@ -68,6 +74,7 @@ class Database:
         "max_per_run": "INTEGER NOT NULL DEFAULT 20",
         "scan_cursor": "TEXT",
         "history_complete": "INTEGER NOT NULL DEFAULT 0",
+        "verify_cursor": "INTEGER NOT NULL DEFAULT 0",
         "next_sync_at": "TEXT",
         "last_error": "TEXT NOT NULL DEFAULT ''",
         "failures": "INTEGER NOT NULL DEFAULT 0",
@@ -149,8 +156,7 @@ class Database:
         with self.connect() as c:
             rows = c.execute("""SELECT c.*,
                 (SELECT COUNT(DISTINCT p.id) FROM posts p JOIN post_sources s ON s.post_id=p.id
-                 WHERE p.account_id=c.account_id AND s.source IN
-                   ('creator:'||c.username||':posts','creator:'||c.username||':reels')
+                 WHERE p.account_id=c.account_id AND s.source='creator:'||c.username||':posts'
                    AND p.status='complete' AND p.deleted_at IS NULL) AS archived_count
                 FROM creators c WHERE c.account_id=? AND c.manual=1 ORDER BY c.enabled DESC,c.username""",
                               (account_id,)).fetchall()
@@ -204,6 +210,11 @@ class Database:
             c.execute("UPDATE creators SET scan_cursor=?,history_complete=? WHERE account_id=? AND username=?",
                       (cursor, int(history_complete), account_id, username))
 
+    def update_creator_verify_cursor(self, account_id, username, cursor):
+        with self.connect() as c:
+            c.execute("UPDATE creators SET verify_cursor=? WHERE account_id=? AND username=?",
+                      (int(cursor), account_id, username))
+
     def mark_creator_sync(self, account_id, username, error="", rate_limited=False):
         with self.connect() as c:
             row = c.execute("SELECT interval_minutes,failures FROM creators WHERE account_id=? AND username=?",
@@ -235,6 +246,20 @@ class Database:
             for post in posts:
                 post["items"] = [dict(x) for x in c.execute(
                     "SELECT media_id,position,kind,extension FROM media WHERE post_id=? ORDER BY position",
+                    (post["id"],))]
+            return posts
+
+    def creator_complete_posts(self, account_id, username, after_id=0, limit=50):
+        source = f"creator:{username}:posts"
+        with self.connect() as c:
+            posts = [dict(x) for x in c.execute("""SELECT p.* FROM posts p JOIN post_sources s ON s.post_id=p.id
+                    WHERE p.account_id=? AND s.source=? AND p.status='complete'
+                      AND p.deleted_at IS NULL AND p.id>?
+                    ORDER BY p.id LIMIT ?""", (account_id, source, int(after_id), int(limit)))]
+            for post in posts:
+                post["account_id"] = account_id
+                post["items"] = [dict(x) for x in c.execute(
+                    "SELECT media_id,position,kind,extension,relative_path,size FROM media WHERE post_id=? ORDER BY position",
                     (post["id"],))]
             return posts
 
@@ -319,6 +344,21 @@ class Database:
             c.execute("INSERT INTO runs(id,account_id,kind) VALUES(?,?,?)", (run_id, account_id, kind))
         return run_id
 
+    def recover_interrupted_runs(self):
+        with self.connect() as c:
+            rows = c.execute("SELECT id FROM runs WHERE status='running'").fetchall()
+            for row in rows:
+                c.execute("UPDATE runs SET status='interrupted',message=?,finished_at=CURRENT_TIMESTAMP WHERE id=?",
+                          ("容器重启前任务未完成，请重新同步", row["id"]))
+                c.execute("INSERT INTO run_logs(run_id,level,source,message) VALUES(?,?,?,?)",
+                          (row["id"], "WARNING", "startup", "检测到进程重启，任务已标记中断；请重新启动同步"))
+        return len(rows)
+
+    def add_system_event(self, level, source, message):
+        with self.connect() as c:
+            c.execute("INSERT INTO system_events(level,source,message) VALUES(?,?,?)",
+                      (str(level)[:10].upper(), str(source)[:100], str(message)[:6000]))
+
     def finish_run(self, run_id, status, counts, message=""):
         with self.connect() as c:
             c.execute("""UPDATE runs SET status=?,downloaded=?,skipped=?,failed=?,message=?,
@@ -356,7 +396,7 @@ class Database:
     def dashboard(self, account_id=""):
         clause, args = (" AND p.account_id=?", [account_id]) if account_id else ("", [])
         where = ("p.status='complete' AND p.deleted_at IS NULL "
-                 "AND EXISTS(SELECT 1 FROM post_sources s WHERE s.post_id=p.id AND s.source LIKE 'creator:%')") + clause
+                 "AND EXISTS(SELECT 1 FROM post_sources s WHERE s.post_id=p.id AND substr(s.source,-6)=':posts')") + clause
         with self.connect() as c:
             total = c.execute(f"SELECT COUNT(*) FROM posts p WHERE {where}", args).fetchone()[0]
             size = c.execute(f"SELECT COALESCE(SUM(m.size),0) FROM media m JOIN posts p ON p.id=m.post_id WHERE {where}", args).fetchone()[0]
@@ -387,7 +427,7 @@ class Database:
         where.append("p.deleted_at IS NOT NULL" if filters.get("deleted") == "1" else "p.deleted_at IS NULL")
         # The product only synchronizes manually selected creators. Keep legacy
         # saved-list rows in SQLite for migration safety, but omit them from UI.
-        where.append("EXISTS(SELECT 1 FROM post_sources s WHERE s.post_id=p.id AND s.source LIKE 'creator:%')")
+        where.append("EXISTS(SELECT 1 FROM post_sources s WHERE s.post_id=p.id AND substr(s.source,-6)=':posts')")
         page, limit = max(1,int(filters.get("page",1))), min(100,max(1,int(filters.get("limit",20))))
         sql = " AND ".join(where)
         with self.connect() as c:
@@ -418,19 +458,39 @@ class Database:
             return result.rowcount
 
     def system_logs(self, filters):
-        where, args = ["1=1"], []
-        for key, column in (("date", "date(l.created_at,'+8 hours')"), ("account", "r.account_id"),
-                            ("level", "l.level"), ("run", "l.run_id")):
-            if filters.get(key):
-                where.append(column+"=?"); args.append(filters[key])
+        run_where, run_args = ["1=1"], []
+        event_where, event_args = ["1=1"], []
+        if filters.get("date"):
+            run_where.append("date(l.created_at,'+8 hours')=?"); run_args.append(filters["date"])
+            event_where.append("date(e.created_at,'+8 hours')=?"); event_args.append(filters["date"])
+        if filters.get("account"):
+            run_where.append("r.account_id=?"); run_args.append(filters["account"])
+            event_where.append("0=1")
+        if filters.get("level"):
+            run_where.append("l.level=?"); run_args.append(filters["level"])
+            event_where.append("e.level=?"); event_args.append(filters["level"])
+        if filters.get("run"):
+            run_where.append("l.run_id=?"); run_args.append(filters["run"])
+            event_where.append("0=1")
         if filters.get("q"):
-            where.append("(l.message LIKE ? OR l.source LIKE ?)"); args.extend(['%'+filters['q']+'%']*2)
+            run_where.append("(l.message LIKE ? OR l.source LIKE ?)"); run_args.extend(['%'+filters['q']+'%']*2)
+            event_where.append("(e.message LIKE ? OR e.source LIKE ?)"); event_args.extend(['%'+filters['q']+'%']*2)
         page, limit = max(1,int(filters.get("page",1))), min(500,max(1,int(filters.get("limit",100))))
-        sql = " FROM run_logs l JOIN runs r ON r.id=l.run_id LEFT JOIN accounts a ON a.id=r.account_id WHERE "+' AND '.join(where)
+        run_from = " FROM run_logs l JOIN runs r ON r.id=l.run_id LEFT JOIN accounts a ON a.id=r.account_id WHERE "+' AND '.join(run_where)
+        event_from = " FROM system_events e WHERE "+' AND '.join(event_where)
         with self.connect() as c:
-            total = c.execute("SELECT COUNT(*)"+sql,args).fetchone()[0]
-            rows = [dict(r) for r in c.execute("SELECT l.*,r.kind,r.status,COALESCE(NULLIF(a.label,''),a.username,'系统') AS account_label"+sql+
-                                              " ORDER BY l.id DESC LIMIT ? OFFSET ?",(*args,limit,(page-1)*limit))]
+            total = c.execute("SELECT COUNT(*)"+run_from,run_args).fetchone()[0]
+            total += c.execute("SELECT COUNT(*)"+event_from,event_args).fetchone()[0]
+            rows = [dict(r) for r in c.execute("""SELECT * FROM (
+                SELECT l.id AS id,l.run_id AS run_id,l.level AS level,l.source AS source,
+                       l.message AS message,l.created_at AS created_at,r.kind AS kind,r.status AS status,
+                       COALESCE(NULLIF(a.label,''),a.username,'系统') AS account_label
+                """+run_from+""" UNION ALL
+                SELECT -e.id AS id,NULL AS run_id,e.level AS level,e.source AS source,
+                       e.message AS message,e.created_at AS created_at,'system' AS kind,'event' AS status,
+                       '系统' AS account_label
+                """+event_from+""" ) ORDER BY created_at DESC,id DESC LIMIT ? OFFSET ?""",
+                (*run_args,*event_args,limit,(page-1)*limit))]
         return {"items":rows,"total":total,"page":page,"limit":limit}
 
     def admin_accounts(self):
@@ -462,3 +522,4 @@ class Database:
         days = max(1,int(self.setting('log_days','30')))
         with self.connect() as c:
             c.execute("DELETE FROM run_logs WHERE created_at<datetime('now','-'||?||' days')",(days,))
+            c.execute("DELETE FROM system_events WHERE created_at<datetime('now','-'||?||' days')",(days,))
