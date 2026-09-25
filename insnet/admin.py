@@ -43,16 +43,11 @@ def post(server, path, value):
     if path == "/api/config":
         try:
             config = {key: int(value[key]) for key in (
-                "creator_interval", "creator_max", "saved_interval", "saved_max",
-                "saved_recent", "saved_enabled", "scheduler_enabled", "log_days")}
+                "creator_interval", "creator_max", "scheduler_enabled", "log_days")}
         except (KeyError, TypeError, ValueError):
             raise ValueError("系统配置缺少有效参数")
         if not (30 <= config["creator_interval"] <= 10080
                 and 1 <= config["creator_max"] <= 200
-                and 30 <= config["saved_interval"] <= 10080
-                and 1 <= config["saved_max"] <= 200
-                and config["saved_recent"] in (0, 1)
-                and config["saved_enabled"] in (0, 1)
                 and config["scheduler_enabled"] in (0, 1)
                 and 1 <= config["log_days"] <= 365):
             raise ValueError("同步周期需为 30–10080 分钟，上限需为 1–200 条，日志保留需为 1–365 天")
@@ -116,9 +111,8 @@ def post(server, path, value):
             if not isinstance(value["enabled"], bool):
                 raise ValueError("授权开关无效")
             fields["enabled"] = int(value["enabled"])
-        for key in ("creator_subdir", "saved_subdir"):
-            if key in value:
-                fields[key] = _safe_subdir(value[key], server.archive_root)
+        if "creator_subdir" in value:
+            fields["creator_subdir"] = _safe_subdir(value["creator_subdir"], server.archive_root)
         if not fields:
             raise ValueError("没有可保存的修改")
         with db.connect() as conn:

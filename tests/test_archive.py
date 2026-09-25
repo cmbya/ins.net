@@ -109,31 +109,31 @@ class ArchiveTests(unittest.TestCase):
     def test_regular_posts_unpacks_json_messages(self):
         gallery = GalleryDL()
         with patch.object(gallery, "_run", return_value=(json.dumps(MESSAGES), "")):
-            items = gallery.posts("cookies.txt", "https://www.instagram.com/owner/saved/")
+            items = gallery.posts("cookies.txt", "https://www.instagram.com/owner/posts/")
         self.assertEqual(len(items), 1)
         self.assertEqual(items[0]["shortcode"], "ABC123")
 
-    def test_partial_download_retries_and_dedupes_saved_source(self):
+    def test_partial_download_retries_then_skips_completed_creator_post(self):
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
             fake = FakeGallery()
             fake.partial = True
             db, account, fake, archive = self.setup_service(root, fake)
             service = SyncService(db, root, fake, archive_root=archive)
-            counts, error = service.run(account, "saved")
+            db.add_creator(account["id"], "creator")
+            counts, error = service.run(account, "creator", username="creator")
             self.assertEqual(counts["failed"], 1)
             self.assertEqual(db.posts(account["id"])[0]["status"], "partial")
-            db.add_creator(account["id"], "creator")
             fake.partial = False
             counts, error = service.run(account, "creator", username="creator")
             self.assertEqual(counts["downloaded"], 1)
-            saved = db.posts(account["id"])[0]
-            self.assertEqual(saved["status"], "complete")
-            self.assertEqual(saved["sources"], ["creator:creator:posts", "saved"])
-            self.assertTrue(all((archive / item["relative_path"]).is_file() for item in saved["media"]))
+            archived = db.posts(account["id"])[0]
+            self.assertEqual(archived["status"], "complete")
+            self.assertEqual(archived["sources"], ["creator:creator:posts"])
+            self.assertTrue(all((archive / item["relative_path"]).is_file() for item in archived["media"]))
             self.assertEqual(fake.calls, 2)
             self.assertTrue(all("/reels/" not in url for url, _, _ in fake.scan_requests))
-            counts, error = service.run(account, "saved")
+            counts, error = service.run(account, "creator", username="creator")
             self.assertEqual(counts["skipped"], 1)
             self.assertEqual(fake.calls, 2)
 
@@ -225,7 +225,8 @@ class ArchiveTests(unittest.TestCase):
                     raise OSError(errno.EXDEV, "Invalid cross-device link")
                 return real_replace(src, dst)
             with patch("insnet.sync.os.replace", side_effect=fail_on_cross_mount):
-                counts, error = service.run(account, "saved")
+                db.add_creator(account["id"], "creator")
+                counts, error = service.run(account, "creator", username="creator")
             self.assertEqual(counts["downloaded"], 1)
             self.assertEqual(counts["failed"], 0)
             self.assertEqual(error, "")
@@ -307,9 +308,7 @@ class ArchiveTests(unittest.TestCase):
             self.assertEqual(creator["failures"], 1)
             self.assertEqual(creator["last_error"], "HTTP 429")
             self.assertFalse(db.due_creators(account_id))
-            db.set_saved_schedule(account_id, True, 90)
-            db.mark_saved_sync(account_id)
-            self.assertEqual(db.account(account_id)["saved_interval_minutes"], 90)
+            self.assertEqual(db.admin_config()["creator_interval"], 360)
 
     def test_failure_log_contains_diagnostics_and_redacts_cookie(self):
         with tempfile.TemporaryDirectory() as temporary:

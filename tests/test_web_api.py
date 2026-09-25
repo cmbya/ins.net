@@ -66,12 +66,9 @@ class WebApiTests(unittest.TestCase):
                           creator["max_per_run"]), (0, "all", 30, 15))
 
         code, settings = self.request_json("/api/settings", {
-            "account": self.account_id, "media_subdir": "Instagram/test",
-            "auto_saved": False, "saved_interval_minutes": 90})
+            "media_subdir": "Instagram/test"})
         self.assertEqual(code, 200)
         self.assertEqual(settings["media_path"], str(self.archive / "Instagram/test"))
-        self.assertFalse(self.db.account(self.account_id)["auto_saved"])
-        self.assertEqual(self.db.account(self.account_id)["saved_interval_minutes"], 90)
 
         self.request_json("/api/creator/delete", {
             "account": self.account_id, "username": "nasa", "mode": "list"})
@@ -117,28 +114,38 @@ class WebApiTests(unittest.TestCase):
         self.assertEqual(logs["total"], 1)
         self.assertEqual(logs["items"][0]["run_id"], run_id)
 
-    def test_system_config_validation_and_saved_defaults(self):
-        config = {"creator_interval":30,"creator_max":12,"saved_interval":60,"saved_max":8,
-                  "saved_recent":0,"saved_enabled":0,"scheduler_enabled":0,"log_days":14,"media_subdir":"Instagram/X"}
+    def test_system_config_validation_and_creator_defaults(self):
+        config = {"creator_interval":30,"creator_max":12,
+                  "scheduler_enabled":0,"log_days":14,"media_subdir":"Instagram/X"}
         code, result = self.request_json("/api/config",config)
         self.assertEqual(code,200)
         self.assertTrue(result["ok"])
         self.assertEqual(self.db.admin_config()["creator_interval"],30)
-        account = self.db.account(self.account_id)
-        self.assertEqual((account["saved_interval_minutes"],account["saved_max_per_run"],account["saved_recent_only"],account["auto_saved"]),(60,8,0,0))
+        self.assertEqual(self.db.admin_config(), {"creator_interval":30,"creator_max":12,"scheduler_enabled":0,"log_days":14})
         before = self.db.setting("media_subdir")
         with self.assertRaises(Exception):
             self.request_json("/api/config",{**config,"media_subdir":"../outside"})
         self.assertEqual(self.db.setting("media_subdir"),before)
         _, accounts = self.request_json("/api/admin/accounts")
         self.assertNotIn("cookie_path",accounts[0])
+        self.assertFalse(any("saved" in key for key in accounts[0]))
+
+    def test_saved_sync_is_disabled_and_old_saved_only_records_are_hidden(self):
+        post = {"shortcode":"OLD001", "username":"nasa", "caption":"Legacy saved post",
+                "published_at":"2026-09-20T12:00:00", "source_url":"https://www.instagram.com/p/OLD001/",
+                "items":[{"media_id":"old101", "position":1, "kind":"image", "extension":"jpg"}]}
+        post_id = self.db.upsert_post(self.account_id, post, "saved")
+        self.db.set_post_status(post_id, "complete")
+        self.assertEqual(self.db.dashboard(self.account_id)["total"], 0)
+        self.assertEqual(self.db.records({"account":self.account_id})["total"], 0)
+        with self.assertRaises(ValueError):
+            self.coordinator.start(self.account_id, "saved")
+        self.assertEqual(self.db.post(post_id)["status"], "complete")
 
     def test_invalid_settings_do_not_change_archive_directory(self):
-        code, before = self.request_json("/api/settings?account=" + self.account_id)
+        code, before = self.request_json("/api/settings")
         with self.assertRaises(Exception):
-            self.request_json("/api/settings", {"account": self.account_id,
-                                "media_subdir": "new", "auto_saved": True,
-                                "saved_interval_minutes": 2})
+            self.request_json("/api/settings", {"media_subdir": "../outside"})
         self.assertEqual(self.db.setting("media_subdir", "Instagram"), before["media_subdir"])
 
 

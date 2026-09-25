@@ -21,7 +21,7 @@ from .sync import Coordinator, SyncService
 
 
 STATIC = Path(__file__).resolve().parent.parent / "static"
-APP_VERSION = "0.5.0"
+APP_VERSION = "0.6.0"
 
 
 def valid_cookie_file(value):
@@ -120,13 +120,9 @@ class Handler(BaseHTTPRequestHandler):
             if path == "/api/settings":
                 subdir = self.server.db.setting("media_subdir", "Instagram")
                 target = self.server.archive_root / subdir if subdir else self.server.archive_root
-                account_id = query.get("account", [""])[0]
-                account = self.server.db.account(account_id) if account_id else None
                 return self.reply(200, {"media_subdir": subdir,
                                         "archive_root": str(self.server.archive_root),
-                                        "media_path": str(target),
-                                        "auto_saved": bool(account["auto_saved"]) if account else True,
-                                        "saved_interval_minutes": int(account["saved_interval_minutes"]) if account else 360})
+                                        "media_path": str(target)})
             match = re.fullmatch(r"/media/(\d+)/([A-Za-z0-9_-]+)", path)
             if match:
                 return self.serve_media(int(match[1]), match[2])
@@ -217,23 +213,9 @@ class Handler(BaseHTTPRequestHandler):
                     raise ValueError("保存目录只能填写 /archive 下的相对路径，不能包含 ..")
                 target = self.server.archive_root / subdir if subdir else self.server.archive_root
                 target.resolve().relative_to(self.server.archive_root)
-                account_id = str(value.get("account", ""))
-                auto_saved = True
-                interval = 360
-                if account_id:
-                    if not self.server.db.account(account_id):
-                        raise ValueError("账号不存在")
-                    auto_saved = value.get("auto_saved", True)
-                    interval = int(value.get("saved_interval_minutes", 360))
-                    if not isinstance(auto_saved, bool) or not 30 <= interval <= 10080:
-                        raise ValueError("已保存帖子同步间隔必须为 30 到 10080 分钟")
                 self.server.db.set_setting("media_subdir", subdir)
-                if account_id:
-                    self.server.db.set_saved_schedule(account_id, auto_saved, interval)
                 return self.reply(200, {"media_subdir": subdir,
-                                        "media_path": str(target),
-                                        "auto_saved": auto_saved,
-                                        "saved_interval_minutes": interval})
+                                        "media_path": str(target)})
             account_id = str(value.get("account", ""))
             if path == "/api/accounts":
                 name = str(value.get("username", "")).strip().lower().lstrip("@")

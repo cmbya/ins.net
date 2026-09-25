@@ -88,7 +88,7 @@ class SyncService:
             self._log(log, "INFO", source, f"跳过 @{post['username']}/{post['shortcode']}：文件已经完整")
             return "skipped"
         date = re.sub(r"\D", "", post["published_at"] or "")[:8] or "undated"
-        folder = (account.get("saved_subdir" if source == "saved" else "creator_subdir") or self.db.setting("media_subdir", "Instagram")).strip("/")
+        folder = (account.get("creator_subdir") or self.db.setting("media_subdir", "Instagram")).strip("/")
         relative = (Path(folder) if folder else Path()) / safe_part(account["username"]) \
                    / safe_part(post["username"]) / f"{date}_{safe_part(post['shortcode'])}"
         self._log(log, "INFO", source,
@@ -236,15 +236,6 @@ class SyncService:
         counts = self._download_batch(account, source, candidates, max_per_run, log)
         return counts
 
-    def _run_saved(self, account, log=None):
-        source = "saved"
-        url = f"https://www.instagram.com/{account['username']}/saved/"
-        self._log(log, "INFO", source, "开始扫描已保存帖子")
-        posts = self.gallery.posts(account["cookie_path"], url, 20 if account.get("saved_recent_only",1) else None)
-        self._persist_scan(account, posts, source)
-        self._log(log, "INFO", source, f"已保存列表读取完成：{len(posts)} 条帖子")
-        return self._download_batch(account, source, posts, int(account.get("saved_max_per_run",20)), log)
-
     def run(self, account, kind, log=None, username=None):
         counts = {"downloaded": 0, "skipped": 0, "failed": 0}
         error = ""
@@ -267,20 +258,6 @@ class SyncService:
                 self._log(log, "ERROR", source, f"同步博主失败：{exc}")
             finally:
                 self.db.mark_creator_sync(account["id"], creator["username"], error, rate_limited)
-        elif kind == "saved":
-            try:
-                counts = self._run_saved(account, log)
-                if counts["failed"]:
-                    errors = self.db.source_errors(account["id"], "saved")
-                    error = errors[0] if errors else "有帖子下载失败，请展开运行日志查看详情"
-                    rate_limited = bool(re.search(r"\b429\b|too many requests|rate.?limit", error, re.I))
-            except Exception as exc:
-                counts["failed"] += 1
-                error = str(exc)[:1800]
-                rate_limited = bool(re.search(r"\b429\b|too many requests|rate.?limit", error, re.I))
-                self._log(log, "ERROR", "saved", f"已保存同步失败：{exc}")
-            finally:
-                self.db.mark_saved_sync(account["id"], error, rate_limited)
         else:
             raise ValueError("未知同步任务")
         self._log(log, "INFO", kind,
@@ -297,7 +274,7 @@ class Coordinator:
         self.stopped = threading.Event()
 
     def start(self, account_id, kind, username=None):
-        if kind not in ("creator", "saved", "check"):
+        if kind not in ("creator", "check"):
             raise ValueError("未知同步任务")
         account = self.db.account(account_id)
         if not account:
@@ -314,7 +291,7 @@ class Coordinator:
             if account_id in self.active:
                 raise ValueError("该账号有任务正在运行")
             self.active.add(account_id)
-            run_kind = f"creator:@{username}" if kind == "creator" else ("authorization-check" if kind == "check" else "saved")
+            run_kind = f"creator:@{username}" if kind == "creator" else "authorization-check"
             run_id = self.db.create_run(account_id, run_kind)
             self.db.add_run_log(run_id, "INFO", run_kind, "任务已创建，等待执行")
         threading.Thread(target=self._execute, args=(run_id, account, kind, username), daemon=True).start()
@@ -324,12 +301,12 @@ class Coordinator:
         counts = {"downloaded": 0, "skipped": 0, "failed": 0}
         log = lambda level, source, message: self.db.add_run_log(run_id, level, source, message)
         try:
-            label = f"@{username}" if kind == "creator" else ("授权检测" if kind == "check" else "已保存")
+            label = f"@{username}" if kind == "creator" else "授权检测"
             log("INFO", kind, f"任务开始：账号 @{account['username']}，来源 {label}")
             if kind == 'check':
-                self.service.gallery.posts(account['cookie_path'], f"https://www.instagram.com/{account['username']}/saved/", 1)
+                self.service.gallery.posts(account['cookie_path'], f"https://www.instagram.com/{account['username']}/posts/", 1)
                 message = ''
-                log('INFO', 'authorization', '已成功访问该账号的已保存接口；未下载媒体')
+                log('INFO', 'authorization', '已成功访问 Instagram 帖子接口；未下载媒体')
             else:
                 counts, message = self.service.run(account, kind, log, username)
             status = "partial" if counts["failed"] else "complete"
@@ -366,8 +343,6 @@ class Coordinator:
                         creator = self.db.due_creators(account_id)
                         if creator:
                             self.start(account_id, "creator", creator["username"])
-                        elif self.db.saved_due(account_id):
-                            self.start(account_id, "saved")
                     except Exception:
                         pass
                 self.stopped.wait(self.poll_interval)

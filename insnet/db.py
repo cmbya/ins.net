@@ -78,14 +78,6 @@ class Database:
         "cookie_status": "TEXT NOT NULL DEFAULT 'unverified'",
         "cookie_checked_at": "TEXT",
         "creator_subdir": "TEXT NOT NULL DEFAULT ''",
-        "saved_subdir": "TEXT NOT NULL DEFAULT ''",
-        "saved_max_per_run": "INTEGER NOT NULL DEFAULT 20",
-        "saved_recent_only": "INTEGER NOT NULL DEFAULT 1",
-        "auto_saved": "INTEGER NOT NULL DEFAULT 1",
-        "saved_interval_minutes": "INTEGER NOT NULL DEFAULT 360",
-        "saved_next_sync_at": "TEXT",
-        "saved_last_sync": "TEXT",
-        "saved_failures": "INTEGER NOT NULL DEFAULT 0",
     }
 
     def __init__(self, root):
@@ -255,32 +247,6 @@ class Database:
                     WHERE p.account_id=? AND s.source=? AND p.status='partial' AND p.deleted_at IS NULL AND p.error IS NOT NULL
                     ORDER BY p.updated_at DESC LIMIT ?""", (account_id, source, limit))]
 
-    def set_saved_schedule(self, account_id, enabled, interval_minutes):
-        with self.connect() as c:
-            c.execute("""UPDATE accounts SET auto_saved=?,saved_interval_minutes=?,
-                         saved_next_sync_at=CASE WHEN ?=1 THEN CURRENT_TIMESTAMP ELSE saved_next_sync_at END
-                         WHERE id=?""",
-                      (int(enabled), int(interval_minutes), int(enabled), account_id))
-
-    def saved_due(self, account_id):
-        with self.connect() as c:
-            return c.execute("""SELECT 1 FROM accounts WHERE id=? AND auto_saved=1
-                         AND (saved_next_sync_at IS NULL OR saved_next_sync_at<=CURRENT_TIMESTAMP)""",
-                              (account_id,)).fetchone() is not None
-
-    def mark_saved_sync(self, account_id, error="", rate_limited=False):
-        with self.connect() as c:
-            account = c.execute("SELECT saved_interval_minutes,saved_failures FROM accounts WHERE id=?",
-                                (account_id,)).fetchone()
-            if not account:
-                return
-            failures = min(8, int(account["saved_failures"] or 0) + 1) if error else 0
-            delay = min(24 * 60, max(30, int(account["saved_interval_minutes"])) * (2 ** min(failures, 5))) \
-                if rate_limited else int(account["saved_interval_minutes"])
-            c.execute("""UPDATE accounts SET saved_last_sync=CURRENT_TIMESTAMP,saved_failures=?,
-                         saved_next_sync_at=datetime('now','+'||?||' minutes') WHERE id=?""",
-                      (failures, delay, account_id))
-
     def delete_creator(self, account_id, username, delete_archive=False):
         """Remove a creator from the monitor list; optionally hide records, never files."""
         with self.connect() as c:
@@ -391,12 +357,12 @@ class Database:
 
     def dashboard(self, account_id=""):
         clause, args = (" AND p.account_id=?", [account_id]) if account_id else ("", [])
-        where = "p.status='complete' AND p.deleted_at IS NULL" + clause
+        where = ("p.status='complete' AND p.deleted_at IS NULL "
+                 "AND EXISTS(SELECT 1 FROM post_sources s WHERE s.post_id=p.id AND s.source LIKE 'creator:%')") + clause
         with self.connect() as c:
             total = c.execute(f"SELECT COUNT(*) FROM posts p WHERE {where}", args).fetchone()[0]
             size = c.execute(f"SELECT COALESCE(SUM(m.size),0) FROM media m JOIN posts p ON p.id=m.post_id WHERE {where}", args).fetchone()[0]
             types = dict(c.execute(f"SELECT m.kind,COUNT(*) FROM media m JOIN posts p ON p.id=m.post_id WHERE {where} GROUP BY m.kind", args))
-            saved = c.execute(f"SELECT COUNT(*) FROM posts p WHERE {where} AND EXISTS(SELECT 1 FROM post_sources s WHERE s.post_id=p.id AND s.source='saved')", args).fetchone()[0]
             creators = [dict(r) for r in c.execute(f"""SELECT p.account_id,p.username,
                 COALESCE(cr.display_name,'') AS display_name,COALESCE(cr.avatar_url,'') AS avatar_url,
                 MAX(CASE WHEN cr.manual=1 THEN 1 ELSE 0 END) AS monitored, COUNT(*) AS count FROM posts p LEFT JOIN creators cr ON cr.account_id=p.account_id AND cr.username=p.username
@@ -405,7 +371,7 @@ class Database:
                 FROM posts p WHERE {where} AND p.synced_at>=datetime('now','-13 days')
                 GROUP BY day ORDER BY day""", args)]
             return {"total": total, "bytes": size, "images": types.get("image",0), "videos": types.get("video",0),
-                    "saved": saved, "authors": creators, "trend": trend}
+                    "authors": creators, "trend": trend}
 
     def records(self, filters):
         where, args = ["1=1"], []
@@ -421,9 +387,9 @@ class Database:
                 if value:
                     where.append(f"date(p.{field},'+8 hours'){op}?"); args.append(value)
         where.append("p.deleted_at IS NOT NULL" if filters.get("deleted") == "1" else "p.deleted_at IS NULL")
-        if filters.get("source") in ("saved", "creator"):
-            where.append("EXISTS(SELECT 1 FROM post_sources s WHERE s.post_id=p.id AND s.source LIKE ?)")
-            args.append("saved" if filters["source"] == "saved" else "creator:%")
+        # The product only synchronizes manually selected creators. Keep legacy
+        # saved-list rows in SQLite for migration safety, but omit them from UI.
+        where.append("EXISTS(SELECT 1 FROM post_sources s WHERE s.post_id=p.id AND s.source LIKE 'creator:%')")
         page, limit = max(1,int(filters.get("page",1))), min(100,max(1,int(filters.get("limit",20))))
         sql = " AND ".join(where)
         with self.connect() as c:
@@ -470,10 +436,13 @@ class Database:
         return {"items":rows,"total":total,"page":page,"limit":limit}
 
     def admin_accounts(self):
-        return [{k:v for k,v in a.items() if k != 'cookie_path'} for a in self.accounts()]
+        legacy = {"cookie_path", "saved_subdir", "saved_max_per_run", "saved_recent_only",
+                  "auto_saved", "saved_interval_minutes", "saved_next_sync_at",
+                  "saved_last_sync", "saved_failures"}
+        return [{k:v for k,v in a.items() if k not in legacy} for a in self.accounts()]
 
     def admin_config(self):
-        defaults = {"creator_interval":"360","creator_max":"20","saved_interval":"360","saved_max":"20","saved_recent":"1","saved_enabled":"1","scheduler_enabled":"1","log_days":"30"}
+        defaults = {"creator_interval":"360","creator_max":"20","scheduler_enabled":"1","log_days":"30"}
         return {k:int(self.setting(k,v)) for k,v in defaults.items()}
 
     def save_admin_config(self, config):
@@ -481,10 +450,6 @@ class Database:
             for key, value in config.items():
                 c.execute("INSERT INTO settings(key,value) VALUES(?,?) "
                           "ON CONFLICT(key) DO UPDATE SET value=excluded.value", (key, str(value)))
-            c.execute("UPDATE accounts SET auto_saved=?,saved_interval_minutes=?,saved_max_per_run=?,saved_recent_only=?, "
-                      "saved_next_sync_at=CASE WHEN ?=1 THEN CURRENT_TIMESTAMP ELSE saved_next_sync_at END",
-                      (config["saved_enabled"], config["saved_interval"], config["saved_max"],
-                       config["saved_recent"], config["saved_enabled"]))
 
     def purge_old_logs(self):
         days = max(1,int(self.setting('log_days','30')))
