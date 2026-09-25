@@ -259,6 +259,30 @@ class ArchiveTests(unittest.TestCase):
             db.upsert_post(account_id, original, "saved")
             self.assertTrue(db.post(post_id)["deleted_at"])
 
+    def test_deleted_posts_are_reported_as_dedupe_skips_not_complete_archives(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            original = post("DELETED", username="creator")
+            db, account, fake, archive = self.setup_service(root, FakeGallery([original]))
+            db.add_creator(account["id"], "creator")
+            post_id = db.upsert_post(account["id"], original, "creator:creator:posts")
+            marker = archive / "creator" / "deleted.jpg"
+            marker.parent.mkdir(parents=True)
+            marker.write_bytes(b"archive")
+            db.set_media_file(post_id, original["items"][0]["media_id"], "creator/deleted.jpg", 7, "jpg")
+            db.set_post_status(post_id, "complete")
+            db.hide_records(account["id"], username="creator")
+
+            logs = []
+            service = SyncService(db, root, fake, archive_root=archive)
+            counts, error = service.run(account, "creator", log=lambda *entry: logs.append(entry), username="creator")
+
+            self.assertEqual((counts["downloaded"], counts["skipped"], counts["failed"]), (0, 1, 0))
+            self.assertEqual(error, "")
+            summary = next(message for _, _, message in logs if message.startswith("跳过 1 条："))
+            self.assertIn("已删除记录的去重保护 1 条", summary)
+            self.assertIn("文件已完整 0 条（其中本轮扫描到 0 条）", summary)
+
     def test_removing_creator_from_list_keeps_posts_and_file_relations(self):
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)

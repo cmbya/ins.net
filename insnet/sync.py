@@ -166,10 +166,12 @@ class SyncService:
         counts = {"downloaded": 0, "skipped": 0, "failed": 0}
         attempts = 0
         scanned_skips = 0
+        deleted_skips = 0
         for post in posts:
             stored = self.db.post(post['id'])
             if stored and stored.get('deleted_at'):
                 counts['skipped'] += 1
+                deleted_skips += 1
                 self._log(log, 'INFO', source, f"跳过 {post['shortcode']}：已删除记录（文件保留，禁止重复下载）")
                 continue
             if post.get("status") == "complete" and not post.get("scanned_this_run"):
@@ -186,8 +188,10 @@ class SyncService:
             result = self._archive(account, post, source, log)
             counts[result] += 1
         if counts["skipped"]:
+            archived_skips = counts["skipped"] - deleted_skips
             self._log(log, "INFO", source,
-                      f"跳过 {counts['skipped']} 条已完整归档的帖子；本轮扫描结果中 {scanned_skips} 条")
+                      f"跳过 {counts['skipped']} 条：已删除记录的去重保护 {deleted_skips} 条，"
+                      f"文件已完整 {archived_skips} 条（其中本轮扫描到 {scanned_skips} 条）")
         queued = max(0, len(posts) - attempts - counts["skipped"])
         if queued:
             self._log(log, "INFO", source,
