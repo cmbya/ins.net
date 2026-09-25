@@ -394,6 +394,33 @@ class ArchiveTests(unittest.TestCase):
             media = db.post_media(post_id)[0]
             self.assertTrue((archive / media["relative_path"]).is_file())
 
+    def test_cleared_post_checks_current_archive_not_legacy_data_volume(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            original = post("DELETED", username="creator")
+            db, account, fake, archive = self.setup_service(root, FakeGallery([original]))
+            db.add_creator(account["id"], "creator")
+            post_id = db.upsert_post(account["id"], original, "creator:creator:posts")
+            marker = archive / "creator" / "deleted.jpg"
+            legacy = root / "media" / "creator" / "deleted.jpg"
+            marker.parent.mkdir(parents=True)
+            legacy.parent.mkdir(parents=True)
+            marker.write_bytes(b"archive")
+            legacy.write_bytes(b"archive")
+            db.set_media_file(post_id, original["items"][0]["media_id"], "creator/deleted.jpg", 7, "jpg")
+            db.set_post_status(post_id, "complete")
+            db.hide_records(account["id"], username="creator")
+            marker.unlink()
+
+            service = SyncService(db, root, fake, archive_root=archive)
+            counts, error = service.run(account, "creator", username="creator")
+
+            self.assertEqual((counts["downloaded"], counts["skipped"], counts["failed"]), (1, 0, 0))
+            self.assertEqual(error, "")
+            self.assertEqual(fake.calls, 1)
+            self.assertTrue(legacy.is_file())
+            self.assertIsNone(db.post(post_id)["deleted_at"])
+
     def test_cleared_carousel_downloads_only_media_removed_from_disk(self):
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)

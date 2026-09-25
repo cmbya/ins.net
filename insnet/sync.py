@@ -41,6 +41,20 @@ class SyncService:
         if log:
             log(level, source, message)
 
+    def _archive_path(self, relative_path):
+        """Resolve a stored relative path only inside the configured archive mount."""
+        if not relative_path:
+            return None
+        relative = Path(relative_path)
+        if relative.is_absolute() or ".." in relative.parts:
+            return None
+        target = (self.archive_root / relative).resolve()
+        try:
+            target.relative_to(self.archive_root.resolve())
+        except ValueError:
+            return None
+        return target
+
     def _restore_legacy_media(self, post_id, row, log=None):
         """Copy files from the original /data/media volume into the configured archive mount."""
         if not row["relative_path"]:
@@ -73,14 +87,15 @@ class SyncService:
             # Keep the old record visible via the media endpoint's legacy-root fallback.
             return
 
-    def _archive(self, account, post, source, log=None):
+    def _archive(self, account, post, source, log=None, allow_legacy_restore=True):
         post_id = self.db.upsert_post(account["id"], post, source)
         rows = self.db.post_media(post_id)
-        for row in rows:
-            self._restore_legacy_media(post_id, row, log)
+        if allow_legacy_restore:
+            for row in rows:
+                self._restore_legacy_media(post_id, row, log)
         rows = self.db.post_media(post_id)
-        missing = [row for row in rows if not row["relative_path"] or not
-                   self._file_is_complete(self.archive_root / row["relative_path"], row.get("size", 0))]
+        missing = [row for row in rows if not self._archive_path(row["relative_path"]) or not
+                   self._file_is_complete(self._archive_path(row["relative_path"]), row.get("size", 0))]
         if not missing:
             self.db.set_post_status(post_id, "complete")
             self._log(log, "INFO", source, f"跳过 @{post['username']}/{post['shortcode']}：文件已经完整")
@@ -109,8 +124,8 @@ class SyncService:
                     size = candidate.stat().st_size
                     replace_from_staging(candidate, target)
                     self.db.set_media_file(post_id, row["media_id"], str(relative / filename), size, extension)
-            remaining = [r for r in self.db.post_media(post_id) if not r["relative_path"] or not
-                         self._file_is_complete(self.archive_root / r["relative_path"], r.get("size", 0))]
+            remaining = [r for r in self.db.post_media(post_id) if not self._archive_path(r["relative_path"]) or not
+                         self._file_is_complete(self._archive_path(r["relative_path"]), r.get("size", 0))]
             if remaining:
                 self.db.set_post_status(post_id, "partial", f"缺少 {len(remaining)} 个媒体文件")
                 self._log(log, "ERROR", source,
@@ -154,14 +169,15 @@ class SyncService:
                                                post.get("avatar_url", ""),
                                                post.get("profile_id", ""))
 
-    def _locally_complete(self, post, source, log=None):
+    def _locally_complete(self, post, source, log=None, allow_legacy_restore=True):
         post_id = post.get("id") or self.db.upsert_post(post["account_id"], post, source)
         rows = self.db.post_media(post_id)
-        for row in rows:
-            self._restore_legacy_media(post_id, row, log)
+        if allow_legacy_restore:
+            for row in rows:
+                self._restore_legacy_media(post_id, row, log)
         rows = self.db.post_media(post_id)
-        return bool(rows) and all(row["relative_path"] and
-                                  self._file_is_complete(self.archive_root / row["relative_path"], row.get("size", 0))
+        return bool(rows) and all(self._archive_path(row["relative_path"]) and
+                                  self._file_is_complete(self._archive_path(row["relative_path"]), row.get("size", 0))
                                   for row in rows)
 
     def _download_batch(self, account, source, posts, max_per_run=None, log=None):
@@ -175,7 +191,7 @@ class SyncService:
             if not was_cleared and post.get("status") == "complete" and not post.get("scanned_this_run"):
                 counts["skipped"] += 1
                 continue
-            if self._locally_complete(post, source, log):
+            if self._locally_complete(post, source, log, allow_legacy_restore=not was_cleared):
                 self.db.set_post_status(post["id"], "complete")
                 counts["skipped"] += 1
                 scanned_skips += bool(post.get("scanned_this_run"))
@@ -190,7 +206,7 @@ class SyncService:
                 self._log(log, "INFO", source,
                           f"恢复 {post['shortcode']} 的作品记录：本地媒体缺失，将重新下载缺少的项目")
             attempts += 1
-            result = self._archive(account, post, source, log)
+            result = self._archive(account, post, source, log, allow_legacy_restore=not was_cleared)
             counts[result] += 1
         if counts["skipped"]:
             self._log(log, "INFO", source,
