@@ -364,8 +364,8 @@ class ArchiveTests(unittest.TestCase):
             self.assertEqual((counts["downloaded"], counts["skipped"], counts["failed"]), (0, 1, 0))
             self.assertEqual(error, "")
             summary = next(message for _, _, message in logs if message.startswith("跳过 1 条："))
-            self.assertIn("已删除记录的去重保护 1 条", summary)
-            self.assertIn("文件已完整 0 条（其中本轮扫描到 0 条）", summary)
+            self.assertIn("隐藏记录的去重保护 1 条（媒体未校验）", summary)
+            self.assertIn("已验证文件完整 0 条（其中本轮扫描到 0 条）", summary)
 
     def test_removing_creator_from_list_keeps_posts_and_file_relations(self):
         with tempfile.TemporaryDirectory() as temporary:
