@@ -73,6 +73,14 @@ class Database:
         "failures": "INTEGER NOT NULL DEFAULT 0",
     }
     ACCOUNT_COLUMNS = {
+        "label": "TEXT NOT NULL DEFAULT ''",
+        "enabled": "INTEGER NOT NULL DEFAULT 1",
+        "cookie_status": "TEXT NOT NULL DEFAULT 'unverified'",
+        "cookie_checked_at": "TEXT",
+        "creator_subdir": "TEXT NOT NULL DEFAULT ''",
+        "saved_subdir": "TEXT NOT NULL DEFAULT ''",
+        "saved_max_per_run": "INTEGER NOT NULL DEFAULT 20",
+        "saved_recent_only": "INTEGER NOT NULL DEFAULT 1",
         "auto_saved": "INTEGER NOT NULL DEFAULT 1",
         "saved_interval_minutes": "INTEGER NOT NULL DEFAULT 360",
         "saved_next_sync_at": "TEXT",
@@ -88,12 +96,15 @@ class Database:
             conn.executescript(SCHEMA)
             creator_added = self._ensure_columns(conn, "creators", self.CREATOR_COLUMNS)
             self._ensure_columns(conn, "accounts", self.ACCOUNT_COLUMNS)
+            added = self._ensure_columns(conn, "posts", {"deleted_at": "TEXT", "synced_at": "TEXT"})
+            if "synced_at" in added:
+                conn.execute("UPDATE posts SET synced_at=updated_at WHERE status='complete'")
+            # Imported follow-list entries leave the monitor list while their profile is retained for dashboard history.
+            conn.execute("UPDATE creators SET manual=2,enabled=0 WHERE manual=0")
             # Migrate the old full_sync checkbox exactly once. Do not overwrite
             # choices made in the new UI on every restart.
             if "sync_mode" in creator_added:
                 conn.execute("UPDATE creators SET sync_mode=CASE WHEN full_sync=1 THEN 'all' ELSE 'recent20' END")
-            # The user chose to keep existing archive files but remove imported follow-list entries.
-            conn.execute("DELETE FROM creators WHERE manual=0")
 
     @staticmethod
     def _ensure_columns(conn, table, columns):
@@ -148,8 +159,8 @@ class Database:
                 (SELECT COUNT(DISTINCT p.id) FROM posts p JOIN post_sources s ON s.post_id=p.id
                  WHERE p.account_id=c.account_id AND s.source IN
                    ('creator:'||c.username||':posts','creator:'||c.username||':reels')
-                   AND p.status='complete') AS archived_count
-                FROM creators c WHERE c.account_id=? ORDER BY c.enabled DESC,c.username""",
+                   AND p.status='complete' AND p.deleted_at IS NULL) AS archived_count
+                FROM creators c WHERE c.account_id=? AND c.manual=1 ORDER BY c.enabled DESC,c.username""",
                               (account_id,)).fetchall()
             return [dict(x) for x in rows]
 
@@ -160,11 +171,13 @@ class Database:
             return dict(row) if row else None
 
     def add_creator(self, account_id, username):
+        interval = int(self.setting("creator_interval", "360"))
+        maximum = int(self.setting("creator_max", "20"))
         with self.connect() as c:
-            c.execute("""INSERT INTO creators(account_id,username,manual,enabled,next_sync_at)
-                         VALUES(?,?,1,1,CURRENT_TIMESTAMP)
-                         ON CONFLICT(account_id,username) DO UPDATE SET manual=1""",
-                      (account_id, username))
+            c.execute("""INSERT INTO creators(account_id,username,manual,enabled,next_sync_at,interval_minutes,max_per_run)
+                         VALUES(?,?,1,1,CURRENT_TIMESTAMP,?,?)
+                         ON CONFLICT(account_id,username) DO UPDATE SET manual=1,enabled=1""",
+                      (account_id, username, interval, maximum))
 
     def set_creator(self, account_id, username, *, enabled=None, sync_mode=None,
                     interval_minutes=None, max_per_run=None):
@@ -226,7 +239,7 @@ class Database:
         source = f"creator:{username}:posts"
         with self.connect() as c:
             posts = [dict(x) for x in c.execute("""SELECT p.* FROM posts p JOIN post_sources s ON s.post_id=p.id
-                    WHERE p.account_id=? AND s.source=? AND p.status<>'complete'
+                    WHERE p.account_id=? AND s.source=? AND p.status<>'complete' AND p.deleted_at IS NULL
                     ORDER BY CASE p.status WHEN 'pending' THEN 0 ELSE 1 END,
                              p.published_at DESC,p.id DESC""", (account_id, source))]
             for post in posts:
@@ -239,7 +252,7 @@ class Database:
         with self.connect() as c:
             return [row[0] for row in c.execute("""SELECT p.error FROM posts p
                     JOIN post_sources s ON s.post_id=p.id
-                    WHERE p.account_id=? AND s.source=? AND p.status='partial' AND p.error IS NOT NULL
+                    WHERE p.account_id=? AND s.source=? AND p.status='partial' AND p.deleted_at IS NULL AND p.error IS NOT NULL
                     ORDER BY p.updated_at DESC LIMIT ?""", (account_id, source, limit))]
 
     def set_saved_schedule(self, account_id, enabled, interval_minutes):
@@ -269,31 +282,19 @@ class Database:
                       (failures, delay, account_id))
 
     def delete_creator(self, account_id, username, delete_archive=False):
-        sources = (f"creator:{username}:posts", f"creator:{username}:reels")
-        files, removed, shared = [], 0, 0
+        """Remove a creator from the monitor list; optionally hide records, never files."""
         with self.connect() as c:
             creator = c.execute("SELECT 1 FROM creators WHERE account_id=? AND username=? AND manual=1",
                                 (account_id, username)).fetchone()
             if not creator:
                 return None
+            removed = 0
             if delete_archive:
-                rows = c.execute("""SELECT DISTINCT s.post_id FROM post_sources s JOIN posts p ON p.id=s.post_id
-                                   WHERE p.account_id=? AND s.source IN (?,?)""",
-                                 (account_id, *sources)).fetchall()
-                for item in rows:
-                    post_id = item["post_id"]
-                    c.execute("DELETE FROM post_sources WHERE post_id=? AND source IN (?,?)",
-                              (post_id, *sources))
-                    remaining = c.execute("SELECT COUNT(*) FROM post_sources WHERE post_id=?", (post_id,)).fetchone()[0]
-                    if remaining:
-                        shared += 1
-                        continue
-                    files.extend(x[0] for x in c.execute(
-                        "SELECT relative_path FROM media WHERE post_id=? AND relative_path IS NOT NULL", (post_id,)))
-                    c.execute("DELETE FROM posts WHERE id=?", (post_id,))
-                    removed += 1
-            c.execute("DELETE FROM creators WHERE account_id=? AND username=?", (account_id, username))
-        return {"files": files, "removed_posts": removed, "shared_posts": shared}
+                cur = c.execute("UPDATE posts SET deleted_at=CURRENT_TIMESTAMP WHERE account_id=? AND username=? AND deleted_at IS NULL",
+                                (account_id, username))
+                removed = cur.rowcount
+            c.execute("UPDATE creators SET manual=2,enabled=0 WHERE account_id=? AND username=?", (account_id, username))
+        return {"files": [], "removed_posts": removed, "shared_posts": 0}
 
     def upsert_post(self, account_id, post, source):
         with self.connect() as c:
@@ -327,8 +328,9 @@ class Database:
 
     def set_post_status(self, post_id, status, error=None):
         with self.connect() as c:
-            c.execute("UPDATE posts SET status=?,error=?,updated_at=CURRENT_TIMESTAMP WHERE id=?",
-                      (status, error, post_id))
+            c.execute("UPDATE posts SET status=?,error=?,updated_at=CURRENT_TIMESTAMP, "
+                      "synced_at=CASE WHEN ?='complete' THEN COALESCE(synced_at,CURRENT_TIMESTAMP) ELSE synced_at END WHERE id=?",
+                      (status, error, status, post_id))
 
     def post(self, post_id):
         with self.connect() as c:
@@ -338,7 +340,7 @@ class Database:
     def posts(self, account_id, limit=100):
         with self.connect() as c:
             posts = [dict(x) for x in c.execute(
-                "SELECT * FROM posts WHERE account_id=? ORDER BY published_at DESC,id DESC LIMIT ?",
+                "SELECT * FROM posts WHERE account_id=? AND deleted_at IS NULL ORDER BY published_at DESC,id DESC LIMIT ?",
                 (account_id, limit))]
             for post in posts:
                 post["media"] = [dict(x) for x in c.execute(
@@ -386,3 +388,105 @@ class Database:
                 "SELECT r.*,a.username,(SELECT COUNT(*) FROM run_logs l WHERE l.run_id=r.id) AS log_count "
                 "FROM runs r JOIN accounts a ON a.id=r.account_id "
                 "ORDER BY r.started_at DESC,r.rowid DESC LIMIT ?", (limit,))]
+
+    def dashboard(self, account_id=""):
+        clause, args = (" AND p.account_id=?", [account_id]) if account_id else ("", [])
+        where = "p.status='complete' AND p.deleted_at IS NULL" + clause
+        with self.connect() as c:
+            total = c.execute(f"SELECT COUNT(*) FROM posts p WHERE {where}", args).fetchone()[0]
+            size = c.execute(f"SELECT COALESCE(SUM(m.size),0) FROM media m JOIN posts p ON p.id=m.post_id WHERE {where}", args).fetchone()[0]
+            types = dict(c.execute(f"SELECT m.kind,COUNT(*) FROM media m JOIN posts p ON p.id=m.post_id WHERE {where} GROUP BY m.kind", args))
+            saved = c.execute(f"SELECT COUNT(*) FROM posts p WHERE {where} AND EXISTS(SELECT 1 FROM post_sources s WHERE s.post_id=p.id AND s.source='saved')", args).fetchone()[0]
+            creators = [dict(r) for r in c.execute(f"""SELECT p.account_id,p.username,
+                COALESCE(cr.display_name,'') AS display_name,COALESCE(cr.avatar_url,'') AS avatar_url,
+                MAX(CASE WHEN cr.manual=1 THEN 1 ELSE 0 END) AS monitored, COUNT(*) AS count FROM posts p LEFT JOIN creators cr ON cr.account_id=p.account_id AND cr.username=p.username
+                WHERE {where} GROUP BY p.account_id,p.username ORDER BY count DESC,p.username""", args)]
+            trend = [dict(r) for r in c.execute(f"""SELECT date(p.synced_at,'+8 hours') AS day,COUNT(*) AS count
+                FROM posts p WHERE {where} AND p.synced_at>=datetime('now','-13 days')
+                GROUP BY day ORDER BY day""", args)]
+            return {"total": total, "bytes": size, "images": types.get("image",0), "videos": types.get("video",0),
+                    "saved": saved, "authors": creators, "trend": trend}
+
+    def records(self, filters):
+        where, args = ["1=1"], []
+        for name, column in (("account", "p.account_id"), ("status", "p.status")):
+            if filters.get(name):
+                where.append(column+"=?"); args.append(filters[name])
+        for name, column in (("author", "p.username"), ("title", "p.caption")):
+            if filters.get(name):
+                where.append(column+" LIKE ?"); args.append('%'+filters[name]+'%')
+        for field in ("synced_at", "published_at"):
+            for suffix, op in (("from", ">="), ("to", "<=")):
+                value = filters.get(field+"_"+suffix)
+                if value:
+                    where.append(f"date(p.{field},'+8 hours'){op}?"); args.append(value)
+        where.append("p.deleted_at IS NOT NULL" if filters.get("deleted") == "1" else "p.deleted_at IS NULL")
+        if filters.get("source") in ("saved", "creator"):
+            where.append("EXISTS(SELECT 1 FROM post_sources s WHERE s.post_id=p.id AND s.source LIKE ?)")
+            args.append("saved" if filters["source"] == "saved" else "creator:%")
+        page, limit = max(1,int(filters.get("page",1))), min(100,max(1,int(filters.get("limit",20))))
+        sql = " AND ".join(where)
+        with self.connect() as c:
+            total = c.execute(f"SELECT COUNT(*) FROM posts p WHERE {sql}",args).fetchone()[0]
+            rows = [dict(r) for r in c.execute(f"""SELECT p.*,COALESCE(NULLIF(a.label,''),a.username) AS account_label,
+                COALESCE(cr.display_name,'') AS display_name FROM posts p JOIN accounts a ON p.account_id=a.id
+                LEFT JOIN creators cr ON cr.account_id=p.account_id AND cr.username=p.username
+                WHERE {sql} ORDER BY p.synced_at DESC,p.id DESC LIMIT ? OFFSET ?""",(*args,limit,(page-1)*limit))]
+            for row in rows:
+                row["media"] = [dict(r) for r in c.execute("SELECT * FROM media WHERE post_id=? ORDER BY position",(row["id"],))]
+                row["sources"] = [r[0] for r in c.execute("SELECT source FROM post_sources WHERE post_id=?",(row["id"],))]
+        return {"items":rows,"total":total,"page":page,"limit":limit}
+
+    def hide_records(self, account_id, username=None, ids=None, restore=False):
+        # Soft deletion retains the archive manifest and dedupe tombstone. Never unlink media.
+        where, args = ["account_id=?"], [account_id]
+        if username:
+            where.append("username=?"); args.append(username)
+            where.append("deleted_at IS NULL")
+        elif ids:
+            where.append("id IN ("+','.join('?' for _ in ids)+")"); args.extend(ids)
+            where.append("deleted_at IS NOT NULL" if restore else "deleted_at IS NULL")
+        else:
+            raise ValueError("请选择作品或作者")
+        with self.connect() as c:
+            result = c.execute("UPDATE posts SET deleted_at="+("NULL" if restore else "CURRENT_TIMESTAMP")+
+                               " WHERE "+' AND '.join(where),args)
+            return result.rowcount
+
+    def system_logs(self, filters):
+        where, args = ["1=1"], []
+        for key, column in (("date", "date(l.created_at,'+8 hours')"), ("account", "r.account_id"),
+                            ("level", "l.level"), ("run", "l.run_id")):
+            if filters.get(key):
+                where.append(column+"=?"); args.append(filters[key])
+        if filters.get("q"):
+            where.append("(l.message LIKE ? OR l.source LIKE ?)"); args.extend(['%'+filters['q']+'%']*2)
+        page, limit = max(1,int(filters.get("page",1))), min(500,max(1,int(filters.get("limit",100))))
+        sql = " FROM run_logs l JOIN runs r ON r.id=l.run_id LEFT JOIN accounts a ON a.id=r.account_id WHERE "+' AND '.join(where)
+        with self.connect() as c:
+            total = c.execute("SELECT COUNT(*)"+sql,args).fetchone()[0]
+            rows = [dict(r) for r in c.execute("SELECT l.*,r.kind,r.status,COALESCE(NULLIF(a.label,''),a.username,'系统') AS account_label"+sql+
+                                              " ORDER BY l.id DESC LIMIT ? OFFSET ?",(*args,limit,(page-1)*limit))]
+        return {"items":rows,"total":total,"page":page,"limit":limit}
+
+    def admin_accounts(self):
+        return [{k:v for k,v in a.items() if k != 'cookie_path'} for a in self.accounts()]
+
+    def admin_config(self):
+        defaults = {"creator_interval":"360","creator_max":"20","saved_interval":"360","saved_max":"20","saved_recent":"1","saved_enabled":"1","scheduler_enabled":"1","log_days":"30"}
+        return {k:int(self.setting(k,v)) for k,v in defaults.items()}
+
+    def save_admin_config(self, config):
+        with self.connect() as c:
+            for key, value in config.items():
+                c.execute("INSERT INTO settings(key,value) VALUES(?,?) "
+                          "ON CONFLICT(key) DO UPDATE SET value=excluded.value", (key, str(value)))
+            c.execute("UPDATE accounts SET auto_saved=?,saved_interval_minutes=?,saved_max_per_run=?,saved_recent_only=?, "
+                      "saved_next_sync_at=CASE WHEN ?=1 THEN CURRENT_TIMESTAMP ELSE saved_next_sync_at END",
+                      (config["saved_enabled"], config["saved_interval"], config["saved_max"],
+                       config["saved_recent"], config["saved_enabled"]))
+
+    def purge_old_logs(self):
+        days = max(1,int(self.setting('log_days','30')))
+        with self.connect() as c:
+            c.execute("DELETE FROM run_logs WHERE created_at<datetime('now','-'||?||' days')",(days,))

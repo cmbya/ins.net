@@ -1,37 +1,5 @@
 <!doctype html>
-<html lang="zh-CN">
-<head>
-  <meta charset="utf-8">
-  <meta name="viewport" content="width=device-width, initial-scale=1">
-  <title>ins.net · Instagram 归档</title>
-  <link rel="stylesheet" href="/style.css">
-  <script src="/app.js" defer></script>
-</head>
-<body>
-  <header><div><strong>ins.net</strong><span>Instagram 本地归档</span><small id="build-version">版本检测中</small></div><button id="refresh" hidden>刷新</button></header>
-  <main>
-    <section id="login" class="panel narrow"><h1>登录归档</h1><form id="login-form"><label>管理密码<input name="password" type="password" autocomplete="current-password" required></label><button>登录</button></form></section>
-    <div id="workspace" hidden>
-      <section class="intro"><h1>你的 Instagram 归档</h1><p>只同步你手动添加的博主和自己保存的帖子。博主可选最新 20 条或完整历史；每条帖子下载后都会去重，已完整归档的文件会直接跳过。</p></section>
-      <div id="notice" role="status"></div>
-      <section class="panel"><div class="title"><h2>账号</h2><select id="account"></select></div>
-        <details><summary>添加账号 / 更新 Cookie</summary><form id="account-form"><label>Instagram 用户名<input name="username" placeholder="your_username" required></label><label>Netscape 格式 Cookie 文件<input name="cookies" type="file" accept=".txt" required></label><button>保存账号</button></form><p class="hint">Cookie 保存在本地数据目录，必须包含 instagram.com 的 sessionid。相同用户名会更新 Cookie，请勿上传到公开仓库。</p></details>
-      </section>
-      <section class="panel"><div class="title"><h2>同步已保存</h2><span class="hint">自动同步间隔可在下方设置</span></div><button id="saved-sync" class="primary">立即同步已保存帖子</button></section>
-      <section class="panel"><div class="title"><h2>归档设置</h2><span class="hint">NAS 根目录在 Compose 的 /archive 映射中设置</span></div>
-        <form id="settings-form">
-          <label>保存子目录（相对于 NAS 根目录）<input name="media_subdir" placeholder="Instagram" maxlength="180"></label>
-          <div class="setting-row"><label class="check"><input name="auto_saved" type="checkbox"> 自动同步已保存帖子</label><label>同步间隔（分钟）<input name="saved_interval_minutes" type="number" min="30" max="10080" step="1" required></label></div>
-          <button>保存设置</button>
-        </form><p id="save-path" class="hint"></p>
-      </section>
-      <section class="panel"><div class="title"><h2>监控博主</h2><span class="hint">手动添加；每位博主独立设置同步策略</span></div>
-        <form id="creator-form"><input name="username" placeholder="Instagram 用户名，例如 nasa" aria-label="博主用户名" required><button>添加博主</button></form>
-        <div id="creators" class="creator-list"></div>
-      </section>
-      <section class="panel"><div class="title"><h2>归档记录</h2><span id="post-count" class="hint"></span></div><div id="posts" class="post-list"></div></section>
-      <section class="panel"><h2>最近任务与运行日志</h2><p class="hint">展开“查看运行日志”可查看扫描进度、每条帖子处理结果和详细错误。</p><div id="runs" class="run-list"></div></section>
-    </div>
-  </main>
-</body>
-</html>
+<html lang="zh-CN"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><meta name="color-scheme" content="light"><title>Ins 云 · 同步管理</title><link rel="stylesheet" href="/style.css"></head><body>
+<section id="login" class="login"><form id="login-form" class="login-card"><div class="brand">◈ Ins 云</div><h1>登录同步管理</h1><p class="muted">Instagram 作品归档后台</p><label>管理密码<input name="password" type="password" required autocomplete="current-password"></label><button class="primary">登录</button><p id="login-error" class="error"></p></form></section>
+<div id="workspace" hidden><header><button id="menu" class="icon-button" title="展开/收起菜单">☰</button><div class="brand">◈ Ins 云</div><span class="header-subtitle">Instagram 同步管理</span><div class="header-right"><span id="version"></span><button id="refresh" class="icon-button" title="刷新">↻</button><select id="account" aria-label="选择 Instagram 账号"></select></div></header><aside id="sidebar"><nav id="navigation"></nav><div class="sidebar-foot">手动添加 · 自动归档<br><small>文件保留，记录可管理</small></div></aside><main><div id="tabs"></div><div id="content"></div></main></div>
+<div id="toast" role="status" hidden></div><dialog id="modal"><div class="modal-head"><h2 id="modal-title"></h2><button id="modal-close" aria-label="关闭">×</button></div><div id="modal-body"></div></dialog><script src="/app.js"></script></body></html>

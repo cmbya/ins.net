@@ -74,6 +74,9 @@ class SyncService:
 
     def _archive(self, account, post, source, log=None):
         post_id = self.db.upsert_post(account["id"], post, source)
+        if self.db.post(post_id).get("deleted_at"):
+            self._log(log, "INFO", source, f"跳过 {post['shortcode']}：记录已删除，保留去重标记")
+            return "skipped"
         rows = self.db.post_media(post_id)
         for row in rows:
             self._restore_legacy_media(post_id, row, log)
@@ -85,7 +88,7 @@ class SyncService:
             self._log(log, "INFO", source, f"跳过 @{post['username']}/{post['shortcode']}：文件已经完整")
             return "skipped"
         date = re.sub(r"\D", "", post["published_at"] or "")[:8] or "undated"
-        folder = self.db.setting("media_subdir", "Instagram").strip("/")
+        folder = (account.get("saved_subdir" if source == "saved" else "creator_subdir") or self.db.setting("media_subdir", "Instagram")).strip("/")
         relative = (Path(folder) if folder else Path()) / safe_part(account["username"]) \
                    / safe_part(post["username"]) / f"{date}_{safe_part(post['shortcode'])}"
         self._log(log, "INFO", source,
@@ -101,7 +104,8 @@ class SyncService:
                     if extension not in ("jpg", "jpeg", "png", "webp", "gif", "mp4", "mov", "webm", "mkv"):
                         continue
                     filename = f"{row['position']:02d}-{safe_part(row['media_id'])}.{extension}"
-                    target = self.archive_root / relative / filename
+                    target = (self.archive_root / relative / filename).resolve()
+                    target.relative_to(self.archive_root.resolve())
                     target.parent.mkdir(parents=True, exist_ok=True)
                     size = candidate.stat().st_size
                     replace_from_staging(candidate, target)
@@ -163,6 +167,11 @@ class SyncService:
         attempts = 0
         scanned_skips = 0
         for post in posts:
+            stored = self.db.post(post['id'])
+            if stored and stored.get('deleted_at'):
+                counts['skipped'] += 1
+                self._log(log, 'INFO', source, f"跳过 {post['shortcode']}：已删除记录（文件保留，禁止重复下载）")
+                continue
             if post.get("status") == "complete" and not post.get("scanned_this_run"):
                 counts["skipped"] += 1
                 continue
@@ -231,10 +240,10 @@ class SyncService:
         source = "saved"
         url = f"https://www.instagram.com/{account['username']}/saved/"
         self._log(log, "INFO", source, "开始扫描已保存帖子")
-        posts = self.gallery.posts(account["cookie_path"], url, None)
+        posts = self.gallery.posts(account["cookie_path"], url, 20 if account.get("saved_recent_only",1) else None)
         self._persist_scan(account, posts, source)
         self._log(log, "INFO", source, f"已保存列表读取完成：{len(posts)} 条帖子")
-        return self._download_batch(account, source, posts, None, log)
+        return self._download_batch(account, source, posts, int(account.get("saved_max_per_run",20)), log)
 
     def run(self, account, kind, log=None, username=None):
         counts = {"downloaded": 0, "skipped": 0, "failed": 0}
@@ -288,18 +297,24 @@ class Coordinator:
         self.stopped = threading.Event()
 
     def start(self, account_id, kind, username=None):
-        if kind not in ("creator", "saved"):
+        if kind not in ("creator", "saved", "check"):
             raise ValueError("未知同步任务")
         account = self.db.account(account_id)
         if not account:
             raise ValueError("账号不存在")
-        if kind == "creator" and not self.db.creator(account_id, username or ""):
-            raise ValueError("博主不存在")
+        if not account.get("cookie_path"):
+            raise ValueError("账号尚未配置 Cookie，请先更新授权")
+        if kind != "check" and not account.get("enabled", 1):
+            raise ValueError("账号同步已暂停，请先启用")
+        if kind == "creator":
+            creator = self.db.creator(account_id, username or "")
+            if not creator or not creator.get("manual"):
+                raise ValueError("博主不存在或已移出监控列表")
         with self.lock:
             if account_id in self.active:
                 raise ValueError("该账号有任务正在运行")
             self.active.add(account_id)
-            run_kind = f"creator:@{username}" if kind == "creator" else "saved"
+            run_kind = f"creator:@{username}" if kind == "creator" else ("authorization-check" if kind == "check" else "saved")
             run_id = self.db.create_run(account_id, run_kind)
             self.db.add_run_log(run_id, "INFO", run_kind, "任务已创建，等待执行")
         threading.Thread(target=self._execute, args=(run_id, account, kind, username), daemon=True).start()
@@ -309,14 +324,25 @@ class Coordinator:
         counts = {"downloaded": 0, "skipped": 0, "failed": 0}
         log = lambda level, source, message: self.db.add_run_log(run_id, level, source, message)
         try:
-            label = f"@{username}" if kind == "creator" else "已保存"
+            label = f"@{username}" if kind == "creator" else ("授权检测" if kind == "check" else "已保存")
             log("INFO", kind, f"任务开始：账号 @{account['username']}，来源 {label}")
-            counts, message = self.service.run(account, kind, log, username)
+            if kind == 'check':
+                self.service.gallery.posts(account['cookie_path'], f"https://www.instagram.com/{account['username']}/saved/", 1)
+                message = ''
+                log('INFO', 'authorization', '已成功访问该账号的已保存接口；未下载媒体')
+            else:
+                counts, message = self.service.run(account, kind, log, username)
             status = "partial" if counts["failed"] else "complete"
             self.db.finish_run(run_id, status, counts, message)
+            if kind == "check":
+                with self.db.connect() as conn:
+                    conn.execute("UPDATE accounts SET cookie_status='ok',cookie_checked_at=CURRENT_TIMESTAMP WHERE id=?", (account["id"],))
         except Exception as exc:
             message = f"{type(exc).__name__}: {exc}"
             log("ERROR", kind, f"任务异常：{message}")
+            if kind == "check":
+                with self.db.connect() as c:
+                    c.execute("UPDATE accounts SET cookie_status='error',cookie_checked_at=CURRENT_TIMESTAMP WHERE id=?",(account['id'],))
             self.db.finish_run(run_id, "failed", counts, message)
         finally:
             with self.lock:
@@ -325,8 +351,14 @@ class Coordinator:
     def schedule(self):
         def loop():
             while not self.stopped.is_set():
+                self.db.purge_old_logs()
+                if self.db.setting('scheduler_enabled','1') != '1':
+                    self.stopped.wait(self.poll_interval)
+                    continue
                 for account in self.db.accounts():
                     account_id = account["id"]
+                    if not account.get('enabled',1):
+                        continue
                     with self.lock:
                         if account_id in self.active:
                             continue

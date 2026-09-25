@@ -232,39 +232,30 @@ class ArchiveTests(unittest.TestCase):
             media = db.posts(account["id"])[0]["media"]
             self.assertTrue(all((archive / row["relative_path"]).is_file() for row in media))
 
-    def test_creator_deletion_can_preserve_or_remove_archive_and_shared_posts(self):
+    def test_creator_delete_hides_records_but_keeps_media_files_and_dedupe(self):
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
             db, account, _, _ = self.setup_service(root)
             account_id = account["id"]
             db.add_creator(account_id, "alice")
-            db.add_creator(account_id, "bob")
-            exclusive = post("ONLY")
-            legacy_reel = post("OLDREEL")
-            shared_saved = post("SAVED")
-            shared_creator = post("SHARED", username="alice")
-            ids = {}
-            for data, sources, path in [
-                (exclusive, ["creator:alice:posts"], "alice/only.jpg"),
-                (legacy_reel, ["creator:alice:reels"], "alice/old-reel.jpg"),
-                (shared_saved, ["creator:alice:posts", "saved"], "alice/saved.jpg"),
-                (shared_creator, ["creator:alice:posts", "creator:bob:posts"], "alice/shared.jpg"),
-            ]:
-                for source in sources:
-                    post_id = db.upsert_post(account_id, data, source)
-                ids[data["shortcode"]] = post_id
-                db.set_media_file(post_id, data["items"][0]["media_id"], path, 5, "jpg")
-                db.set_post_status(post_id, "complete")
+            original = post("KEEPFILE", username="alice")
+            post_id = db.upsert_post(account_id, original, "creator:alice:posts")
+            marker = root / "archive" / "alice" / "video.jpg"
+            marker.parent.mkdir(parents=True)
+            marker.write_bytes(b"archive")
+            db.set_media_file(post_id, original["items"][0]["media_id"], "alice/video.jpg", 7, "jpg")
+            db.set_post_status(post_id, "complete")
             result = db.delete_creator(account_id, "alice", delete_archive=True)
-            self.assertEqual(result["removed_posts"], 2)
-            self.assertEqual(result["shared_posts"], 2)
-            self.assertEqual(set(result["files"]), {"alice/only.jpg", "alice/old-reel.jpg"})
-            self.assertIsNone(db.post(ids["ONLY"]))
-            self.assertIsNone(db.post(ids["OLDREEL"]))
-            self.assertEqual(db.post(ids["SAVED"])["shortcode"], "SAVED")
-            self.assertEqual(db.post(ids["SHARED"])["shortcode"], "SHARED")
-            self.assertIsNone(db.creator(account_id, "alice"))
-            self.assertIsNotNone(db.creator(account_id, "bob"))
+            self.assertEqual(result["removed_posts"], 1)
+            self.assertEqual(result["files"], [])
+            self.assertTrue(marker.is_file())
+            self.assertIsNotNone(db.post(post_id))
+            self.assertTrue(db.post(post_id)["deleted_at"])
+            self.assertEqual(db.records({"account": account_id, "deleted": "0"})["total"], 0)
+            self.assertEqual(db.records({"account": account_id, "deleted": "1"})["total"], 1)
+            # Re-seeing the post leaves the tombstone in place so it is not downloaded again.
+            db.upsert_post(account_id, original, "saved")
+            self.assertTrue(db.post(post_id)["deleted_at"])
 
     def test_removing_creator_from_list_keeps_posts_and_file_relations(self):
         with tempfile.TemporaryDirectory() as temporary:
@@ -299,7 +290,8 @@ class ArchiveTests(unittest.TestCase):
             conn.commit(); conn.close()
             db = Database(temporary)
             self.assertEqual(db.creator("a", "keep")["sync_mode"], "all")
-            self.assertIsNone(db.creator("a", "imported"))
+            self.assertEqual(db.creator("a", "imported")["manual"], 2)
+            self.assertNotIn("imported", [c["username"] for c in db.creators("a")])
             db.set_creator("a", "keep", sync_mode="recent20")
             reopened = Database(temporary)
             self.assertEqual(reopened.creator("a", "keep")["sync_mode"], "recent20")

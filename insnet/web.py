@@ -15,12 +15,13 @@ from pathlib import Path
 from urllib.parse import parse_qs, urlparse
 
 from .db import Database
+from . import admin
 from .engine import USERNAME
 from .sync import Coordinator, SyncService
 
 
 STATIC = Path(__file__).resolve().parent.parent / "static"
-APP_VERSION = "0.4.0"
+APP_VERSION = "0.5.0"
 
 
 def valid_cookie_file(value):
@@ -102,6 +103,9 @@ class Handler(BaseHTTPRequestHandler):
             return self.reply(401, {"error": "请先登录"})
         query = parse_qs(urlparse(self.path).query)
         try:
+            result = admin.get(self.server, path, query)
+            if result is not None:
+                return self.reply(200, result)
             if path == "/api/accounts":
                 return self.reply(200, [{"id": a["id"], "username": a["username"]} for a in self.server.db.accounts()])
             if path == "/api/creators":
@@ -133,7 +137,7 @@ class Handler(BaseHTTPRequestHandler):
     def serve_media(self, post_id, media_id):
         post = self.server.db.post(post_id)
         row = next((r for r in self.server.db.post_media(post_id) if r["media_id"] == media_id), None) if post else None
-        if not row or not row["relative_path"]:
+        if not row or not row["relative_path"] or post.get("deleted_at"):
             return self.reply(404, {"error": "媒体不存在"})
         relative = Path(row["relative_path"])
         file = None
@@ -198,6 +202,9 @@ class Handler(BaseHTTPRequestHandler):
             if origin and urlparse(origin).netloc != self.headers.get("Host"):
                 return self.reply(403, {"error": "请求来源无效"})
             value = self.body()
+            result = admin.post(self.server, path, value)
+            if result is not None:
+                return self.reply(200, result)
             if path == "/api/settings":
                 raw_subdir = str(value.get("media_subdir", "")).strip()
                 if raw_subdir.startswith("/"):
@@ -242,8 +249,10 @@ class Handler(BaseHTTPRequestHandler):
                 with os.fdopen(descriptor, "w", encoding="utf-8") as stream:
                     stream.write(cookie)
                 os.replace(temporary, target)
+                label = str(value.get("label", "")).strip()[:60]
                 with self.server.db.connect() as conn:
-                    conn.execute("UPDATE accounts SET cookie_path=? WHERE id=?", (str(target), account_id))
+                    conn.execute("UPDATE accounts SET label=?,cookie_path=?,cookie_status='unverified',enabled=1 WHERE id=?",
+                                 (label, str(target), account_id))
                 return self.reply(201, {"id": account_id})
             if not self.server.db.account(account_id):
                 raise ValueError("账号不存在")
@@ -280,43 +289,20 @@ class Handler(BaseHTTPRequestHandler):
                 mode = value.get("mode")
                 if not USERNAME.fullmatch(name) or mode not in ("list", "archive"):
                     raise ValueError("删除参数无效")
-                result = self.server.db.delete_creator(account_id, name, delete_archive=(mode == "archive"))
-                if result is None:
-                    raise ValueError("博主不存在")
-                removed_files, file_errors = 0, []
-                if mode == "archive":
-                    roots = [self.server.archive_root, (self.server.db.root / "media").resolve()]
-                    for raw in result["files"]:
-                        relative = Path(raw)
-                        if relative.is_absolute() or ".." in relative.parts:
-                            file_errors.append(raw)
-                            continue
-                        for root in roots:
-                            file = (root / relative).resolve()
-                            if not file.is_relative_to(root):
-                                continue
-                            try:
-                                if file.is_file():
-                                    file.unlink()
-                                    removed_files += 1
-                                parent = file.parent
-                                while parent != root and parent.is_relative_to(root):
-                                    try:
-                                        parent.rmdir()
-                                    except OSError:
-                                        break
-                                    parent = parent.parent
-                            except OSError:
-                                file_errors.append(raw)
-                return self.reply(200, {"ok": True, "removed_posts": result["removed_posts"],
-                                        "shared_posts": result["shared_posts"],
-                                        "removed_files": removed_files, "file_errors": file_errors})
+                # Older clients may still send archive mode; it now removes records only.
+                with admin.idle(self.server, account_id):
+                    removed = self.server.db.hide_records(account_id, username=name) if mode == "archive" else 0
+                    result = self.server.db.delete_creator(account_id, name, delete_archive=False)
+                    if result is None:
+                        raise ValueError("博主不存在")
+                return self.reply(200, {"ok": True, "removed_posts": removed,
+                                        "shared_posts": 0, "removed_files": 0, "file_errors": []})
             if path == "/api/sync":
                 kind = value.get("kind")
                 username = value.get("username")
                 return self.reply(202, {"run_id": self.server.coordinator.start(account_id, kind, username)})
             self.reply(404, {"error": "未找到"})
-        except (ValueError, TypeError, sqlite3.IntegrityError) as exc:
+        except (ValueError, TypeError, KeyError, sqlite3.IntegrityError) as exc:
             self.reply(400, {"error": str(exc)[:200]})
 
 
