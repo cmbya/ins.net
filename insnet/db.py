@@ -154,7 +154,8 @@ class Database:
                    AND p.status='complete' AND p.deleted_at IS NULL) AS archived_count
                 FROM creators c WHERE c.account_id=? AND c.manual=1 ORDER BY c.enabled DESC,c.username""",
                               (account_id,)).fetchall()
-            return [dict(x) for x in rows]
+            return [{key: value for key, value in dict(x).items()
+                     if key not in ("interval_minutes", "max_per_run")} for x in rows]
 
     def creator(self, account_id, username):
         with self.connect() as c:
@@ -168,22 +169,19 @@ class Database:
         with self.connect() as c:
             c.execute("""INSERT INTO creators(account_id,username,manual,enabled,next_sync_at,interval_minutes,max_per_run)
                          VALUES(?,?,1,1,CURRENT_TIMESTAMP,?,?)
-                         ON CONFLICT(account_id,username) DO UPDATE SET manual=1,enabled=1""",
+                         ON CONFLICT(account_id,username) DO UPDATE SET manual=1,enabled=1,
+                         interval_minutes=excluded.interval_minutes,max_per_run=excluded.max_per_run,
+                         next_sync_at=CURRENT_TIMESTAMP""",
                       (account_id, username, interval, maximum))
 
-    def set_creator(self, account_id, username, *, enabled=None, sync_mode=None,
-                    interval_minutes=None, max_per_run=None):
+    def set_creator(self, account_id, username, *, enabled=None, sync_mode=None):
         fields, values = [], []
-        for field, value in (("enabled", enabled), ("sync_mode", sync_mode),
-                             ("interval_minutes", interval_minutes), ("max_per_run", max_per_run)):
+        for field, value in (("enabled", enabled), ("sync_mode", sync_mode)):
             if value is not None:
                 fields.append(f"{field}=?")
                 values.append(int(value) if field == "enabled" else value)
         if enabled is True:
             fields.append("next_sync_at=CURRENT_TIMESTAMP")
-        elif interval_minutes is not None:
-            fields.append("next_sync_at=datetime('now','+'||?||' minutes')")
-            values.append(int(interval_minutes))
         if not fields:
             return False
         with self.connect() as c:
@@ -450,6 +448,15 @@ class Database:
             for key, value in config.items():
                 c.execute("INSERT INTO settings(key,value) VALUES(?,?) "
                           "ON CONFLICT(key) DO UPDATE SET value=excluded.value", (key, str(value)))
+            interval = int(config["creator_interval"])
+            maximum = int(config["creator_max"])
+            c.execute("""UPDATE creators SET
+                         next_sync_at=CASE WHEN interval_minutes<>? THEN
+                           CASE WHEN last_sync IS NULL THEN CURRENT_TIMESTAMP
+                                ELSE datetime(last_sync,'+'||?||' minutes') END
+                           ELSE next_sync_at END,
+                         interval_minutes=?,max_per_run=? WHERE manual=1""",
+                      (interval, interval, interval, maximum))
 
     def purge_old_logs(self):
         days = max(1,int(self.setting('log_days','30')))

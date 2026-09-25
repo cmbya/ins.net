@@ -250,20 +250,12 @@ class Handler(BaseHTTPRequestHandler):
                     raise ValueError("博主参数无效")
                 enabled = value.get("enabled")
                 sync_mode = value.get("sync_mode")
-                interval = value.get("interval_minutes")
-                maximum = value.get("max_per_run")
                 if enabled is not None and not isinstance(enabled, bool):
                     raise ValueError("自动同步开关无效")
                 if sync_mode is not None and sync_mode not in ("recent20", "all"):
                     raise ValueError("同步范围无效")
-                if interval is not None and (isinstance(interval, bool) or not 30 <= int(interval) <= 10080):
-                    raise ValueError("同步间隔必须为 30 到 10080 分钟")
-                if maximum is not None and (isinstance(maximum, bool) or not 1 <= int(maximum) <= 200):
-                    raise ValueError("每轮下载上限必须为 1 到 200 条")
                 if not self.server.db.set_creator(account_id, name, enabled=enabled,
-                                                 sync_mode=sync_mode,
-                                                 interval_minutes=int(interval) if interval is not None else None,
-                                                 max_per_run=int(maximum) if maximum is not None else None):
+                                                 sync_mode=sync_mode):
                     raise ValueError("博主不存在")
                 return self.reply(200, {"ok": True})
             if path == "/api/creator/delete":

@@ -143,7 +143,7 @@ class ArchiveTests(unittest.TestCase):
             items = [post(f"P{i}", date=f"2026-09-{i:02d}") for i in range(1, 5)]
             db, account, fake, archive = self.setup_service(root, FakeGallery(items))
             db.add_creator(account["id"], "creator")
-            db.set_creator(account["id"], "creator", max_per_run=2)
+            db.save_admin_config({"creator_interval":360,"creator_max":2,"scheduler_enabled":1,"log_days":30})
             service = SyncService(db, root, fake, archive_root=archive)
             first, _ = service.run(account, "creator", username="creator")
             self.assertEqual(first["downloaded"], 2)
@@ -179,7 +179,8 @@ class ArchiveTests(unittest.TestCase):
             fake.history_responses["cursor-B"] = ([post("OLD2", date="2023-01-01")], None)
             db, account, fake, archive = self.setup_service(root, fake)
             db.add_creator(account["id"], "creator")
-            db.set_creator(account["id"], "creator", sync_mode="all", max_per_run=1)
+            db.set_creator(account["id"], "creator", sync_mode="all")
+            db.save_admin_config({"creator_interval":360,"creator_max":1,"scheduler_enabled":1,"log_days":30})
             service = SyncService(db, root, fake, archive_root=archive)
             first, _ = service.run(account, "creator", username="creator")
             self.assertEqual(first["downloaded"], 1)
@@ -297,18 +298,18 @@ class ArchiveTests(unittest.TestCase):
             reopened = Database(temporary)
             self.assertEqual(reopened.creator("a", "keep")["sync_mode"], "recent20")
 
-    def test_429_backoff_and_per_creator_schedule(self):
+    def test_429_backoff_uses_global_creator_interval(self):
         with tempfile.TemporaryDirectory() as temporary:
             db = Database(temporary)
             account_id = db.add_account("owner", Path(temporary) / "cookies.txt")
             db.add_creator(account_id, "creator")
-            db.set_creator(account_id, "creator", interval_minutes=30)
+            db.save_admin_config({"creator_interval":30,"creator_max":20,"scheduler_enabled":1,"log_days":30})
             db.mark_creator_sync(account_id, "creator", "HTTP 429", rate_limited=True)
             creator = db.creator(account_id, "creator")
             self.assertEqual(creator["failures"], 1)
             self.assertEqual(creator["last_error"], "HTTP 429")
             self.assertFalse(db.due_creators(account_id))
-            self.assertEqual(db.admin_config()["creator_interval"], 360)
+            self.assertEqual(db.admin_config()["creator_interval"], 30)
 
     def test_failure_log_contains_diagnostics_and_redacts_cookie(self):
         with tempfile.TemporaryDirectory() as temporary:

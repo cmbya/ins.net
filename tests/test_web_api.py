@@ -57,13 +57,14 @@ class WebApiTests(unittest.TestCase):
         self.assertEqual(code, 200)
         self.assertEqual(creators[0]["username"], "nasa")
         self.assertEqual(creators[0]["sync_mode"], "recent20")
+        self.assertNotIn("interval_minutes", creators[0])
+        self.assertNotIn("max_per_run", creators[0])
 
         self.request_json("/api/creator", {"account": self.account_id, "username": "nasa",
-                                            "enabled": False, "sync_mode": "all",
-                                            "interval_minutes": 30, "max_per_run": 15})
+                                            "enabled": False, "sync_mode": "all"})
         creator = self.db.creator(self.account_id, "nasa")
         self.assertEqual((creator["enabled"], creator["sync_mode"], creator["interval_minutes"],
-                          creator["max_per_run"]), (0, "all", 30, 15))
+                          creator["max_per_run"]), (0, "all", 360, 20))
 
         code, settings = self.request_json("/api/settings", {
             "media_subdir": "Instagram/test"})
@@ -115,6 +116,7 @@ class WebApiTests(unittest.TestCase):
         self.assertEqual(logs["items"][0]["run_id"], run_id)
 
     def test_system_config_validation_and_creator_defaults(self):
+        self.db.add_creator(self.account_id, "nasa")
         config = {"creator_interval":30,"creator_max":12,
                   "scheduler_enabled":0,"log_days":14,"media_subdir":"Instagram/X"}
         code, result = self.request_json("/api/config",config)
@@ -122,6 +124,8 @@ class WebApiTests(unittest.TestCase):
         self.assertTrue(result["ok"])
         self.assertEqual(self.db.admin_config()["creator_interval"],30)
         self.assertEqual(self.db.admin_config(), {"creator_interval":30,"creator_max":12,"scheduler_enabled":0,"log_days":14})
+        creator = self.db.creator(self.account_id, "nasa")
+        self.assertEqual((creator["interval_minutes"],creator["max_per_run"]),(30,12))
         before = self.db.setting("media_subdir")
         with self.assertRaises(Exception):
             self.request_json("/api/config",{**config,"media_subdir":"../outside"})
