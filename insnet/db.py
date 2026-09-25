@@ -396,6 +396,22 @@ class Database:
                 "FROM runs r JOIN accounts a ON a.id=r.account_id "
                 "ORDER BY r.started_at DESC,r.rowid DESC LIMIT ?", (limit,))]
 
+    def clear_run_logs(self, run_id=""):
+        """Remove one finished task and its detail logs, or all finished logs."""
+        with self.connect() as c:
+            if run_id:
+                row = c.execute("SELECT status FROM runs WHERE id=?", (run_id,)).fetchone()
+                if not row:
+                    raise ValueError("任务记录不存在")
+                if row["status"] == "running":
+                    raise ValueError("任务仍在运行，结束后才能清除日志")
+                removed_runs = c.execute("DELETE FROM runs WHERE id=?", (run_id,)).rowcount
+                return {"ok": True, "removed_runs": removed_runs, "removed_events": 0}
+
+            removed_events = c.execute("DELETE FROM system_events").rowcount
+            removed_runs = c.execute("DELETE FROM runs WHERE status<>'running'").rowcount
+            return {"ok": True, "removed_runs": removed_runs, "removed_events": removed_events}
+
     def dashboard(self, account_id=""):
         clause, args = (" AND p.account_id=?", [account_id]) if account_id else ("", [])
         where = ("p.status='complete' AND p.deleted_at IS NULL "

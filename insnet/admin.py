@@ -40,6 +40,12 @@ def get(server, path, query):
 
 def post(server, path, value):
     db = server.db
+    if path == "/api/logs/clear":
+        run_id = str(value.get("run_id", "")).strip()
+        if len(run_id) > 80:
+            raise ValueError("任务编号无效")
+        return db.clear_run_logs(run_id)
+
     if path == "/api/config":
         try:
             config = {key: int(value[key]) for key in (

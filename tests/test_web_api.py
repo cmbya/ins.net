@@ -118,6 +118,67 @@ class WebApiTests(unittest.TestCase):
         self.assertGreaterEqual(logs["total"], 1)
         self.assertEqual(logs["items"][0]["run_id"], run_id)
 
+    def test_clear_one_finished_task_removes_its_summary_and_detail_logs(self):
+        target = self.db.create_run(self.account_id, "creator:@nasa")
+        self.db.add_run_log(target, "INFO", "creator:nasa:posts", "finished target task")
+        self.db.finish_run(target, "complete", {"downloaded": 1, "skipped": 0, "failed": 0})
+        keep = self.db.create_run(self.account_id, "authorization-check")
+        self.db.add_run_log(keep, "INFO", "authorization", "keep this task")
+        self.db.finish_run(keep, "complete", {"downloaded": 0, "skipped": 0, "failed": 0})
+        self.db.add_system_event("ERROR", "scheduler", "keep this event")
+
+        code, result = self.request_json("/api/logs/clear", {"run_id": target})
+
+        self.assertEqual(code, 200)
+        self.assertEqual(result["removed_runs"], 1)
+        run_ids = {run["id"] for run in self.db.runs()}
+        self.assertNotIn(target, run_ids)
+        self.assertIn(keep, run_ids)
+        self.assertEqual(self.db.run_logs(target), [])
+        self.assertEqual(self.db.system_logs({"run": target})["total"], 0)
+        self.assertEqual(self.db.system_logs({"q": "keep this"})["total"], 2)
+
+    def test_clear_all_logs_keeps_running_task_and_archived_media(self):
+        finished = self.db.create_run(self.account_id, "creator:@nasa")
+        self.db.add_run_log(finished, "INFO", "creator:nasa:posts", "finished task")
+        self.db.finish_run(finished, "complete", {"downloaded": 1, "skipped": 0, "failed": 0})
+        active = self.db.create_run(self.account_id, "creator:@nasa")
+        self.db.add_run_log(active, "INFO", "creator:nasa:posts", "running task")
+        self.db.add_system_event("ERROR", "scheduler", "old scheduler event")
+
+        post = {"shortcode":"KEEP001", "username":"nasa", "caption":"Preserve this post",
+                "published_at":None, "source_url":"https://www.instagram.com/p/KEEP001/",
+                "items":[{"media_id":"media1", "position":1, "kind":"image", "extension":"jpg"}]}
+        post_id = self.db.upsert_post(self.account_id, post, "creator:nasa:posts")
+        archived = self.archive / "Instagram" / "keep.jpg"
+        archived.parent.mkdir(parents=True, exist_ok=True)
+        archived.write_bytes(b"media")
+        self.db.set_media_file(post_id, "media1", "Instagram/keep.jpg", 5, "jpg")
+        self.db.set_post_status(post_id, "complete")
+
+        code, result = self.request_json("/api/logs/clear", {})
+
+        self.assertEqual(code, 200)
+        self.assertEqual(result["removed_runs"], 1)
+        self.assertEqual(result["removed_events"], 1)
+        self.assertEqual([run["id"] for run in self.db.runs()], [active])
+        self.assertEqual(self.db.runs()[0]["status"], "running")
+        self.assertEqual(self.db.system_logs({})["total"], 1)
+        self.assertEqual(self.db.post(post_id)["status"], "complete")
+        self.assertTrue(archived.is_file())
+
+    def test_cannot_clear_running_task_logs(self):
+        run_id = self.db.create_run(self.account_id, "creator:@nasa")
+        self.db.add_run_log(run_id, "INFO", "creator:nasa:posts", "running")
+
+        with self.assertRaises(HTTPError) as error:
+            self.request_json("/api/logs/clear", {"run_id": run_id})
+
+        self.assertEqual(error.exception.code, 400)
+        self.assertIn("任务仍在运行", error.exception.read().decode())
+        self.assertEqual(self.db.runs()[0]["id"], run_id)
+        self.assertEqual(len(self.db.run_logs(run_id)), 1)
+
     def test_system_config_validation_and_creator_defaults(self):
         self.db.add_creator(self.account_id, "nasa")
         config = {"creator_interval":30,"creator_max":12,
