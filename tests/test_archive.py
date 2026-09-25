@@ -343,7 +343,7 @@ class ArchiveTests(unittest.TestCase):
             db.upsert_post(account_id, original, "saved")
             self.assertTrue(db.post(post_id)["deleted_at"])
 
-    def test_deleted_posts_are_reported_as_dedupe_skips_not_complete_archives(self):
+    def test_hidden_posts_have_separate_count_and_do_not_emit_per_post_skip_logs(self):
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
             original = post("DELETED", username="creator")
@@ -361,11 +361,14 @@ class ArchiveTests(unittest.TestCase):
             service = SyncService(db, root, fake, archive_root=archive)
             counts, error = service.run(account, "creator", log=lambda *entry: logs.append(entry), username="creator")
 
-            self.assertEqual((counts["downloaded"], counts["skipped"], counts["failed"]), (0, 1, 0))
+            self.assertEqual((counts["downloaded"], counts["skipped"], counts["ignored"], counts["failed"]),
+                             (0, 0, 1, 0))
             self.assertEqual(error, "")
-            summary = next(message for _, _, message in logs if message.startswith("跳过 1 条："))
-            self.assertIn("隐藏记录的去重保护 1 条（媒体未校验）", summary)
-            self.assertIn("已验证文件完整 0 条（其中本轮扫描到 0 条）", summary)
+            summary = next(message for _, _, message in logs if message.startswith("已隐藏 1 条："))
+            self.assertIn("保留去重标记，未校验归档文件，也不会重新下载", summary)
+            self.assertFalse(any("跳过 DELETED" in message for _, _, message in logs))
+            self.assertFalse(any(message.startswith("跳过 1 条") for _, _, message in logs))
+            self.assertEqual(fake.calls, 0)
 
     def test_removing_creator_from_list_keeps_posts_and_file_relations(self):
         with tempfile.TemporaryDirectory() as temporary:
@@ -448,8 +451,30 @@ class ArchiveTests(unittest.TestCase):
             run_id = db.create_run(account_id, "creator:@author")
             db.add_run_log(run_id, "info", "creator:author:posts", "start")
             db.add_run_log(run_id, "error", "creator:author:posts", "HTTP 401")
+            db.finish_run(run_id, "complete", {"downloaded": 0, "skipped": 0, "ignored": 20, "failed": 0})
             self.assertEqual([line["message"] for line in db.run_logs(run_id)], ["start", "HTTP 401"])
             self.assertEqual(db.runs()[0]["log_count"], 2)
+            self.assertEqual(db.runs()[0]["ignored"], 20)
+
+    def test_old_runs_table_gains_ignored_count_during_migration(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            path = Path(temporary) / "insnet.sqlite3"
+            conn = sqlite3.connect(path)
+            conn.executescript("""
+                CREATE TABLE accounts(id TEXT PRIMARY KEY, username TEXT NOT NULL UNIQUE,
+                    cookie_path TEXT NOT NULL, created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP);
+                CREATE TABLE runs(id TEXT PRIMARY KEY, account_id TEXT NOT NULL, kind TEXT NOT NULL,
+                    status TEXT NOT NULL DEFAULT 'running', downloaded INTEGER NOT NULL DEFAULT 0,
+                    skipped INTEGER NOT NULL DEFAULT 0, failed INTEGER NOT NULL DEFAULT 0,
+                    message TEXT NOT NULL DEFAULT '', started_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                    finished_at TEXT);
+                INSERT INTO accounts(id,username,cookie_path) VALUES('a','owner','cookies.txt');
+                INSERT INTO runs(id,account_id,kind) VALUES('r','a','creator');
+            """)
+            conn.commit()
+            conn.close()
+            db = Database(temporary)
+            self.assertEqual(db.runs()[0]["ignored"], 0)
 
     def test_cookie_requires_instagram_session(self):
         self.assertTrue(valid_cookie_file(".instagram.com\tTRUE\t/\tTRUE\t0\tsessionid\tsecret\n"

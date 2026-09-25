@@ -39,7 +39,8 @@ CREATE TABLE IF NOT EXISTS media (
 CREATE TABLE IF NOT EXISTS runs (
     id TEXT PRIMARY KEY, account_id TEXT NOT NULL, kind TEXT NOT NULL,
     status TEXT NOT NULL DEFAULT 'running', downloaded INTEGER NOT NULL DEFAULT 0,
-    skipped INTEGER NOT NULL DEFAULT 0, failed INTEGER NOT NULL DEFAULT 0,
+    skipped INTEGER NOT NULL DEFAULT 0, ignored INTEGER NOT NULL DEFAULT 0,
+    failed INTEGER NOT NULL DEFAULT 0,
     message TEXT NOT NULL DEFAULT '', started_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
     finished_at TEXT
 );
@@ -95,6 +96,7 @@ class Database:
             conn.executescript(SCHEMA)
             creator_added = self._ensure_columns(conn, "creators", self.CREATOR_COLUMNS)
             self._ensure_columns(conn, "accounts", self.ACCOUNT_COLUMNS)
+            self._ensure_columns(conn, "runs", {"ignored": "INTEGER NOT NULL DEFAULT 0"})
             added = self._ensure_columns(conn, "posts", {"deleted_at": "TEXT", "synced_at": "TEXT"})
             if "synced_at" in added:
                 conn.execute("UPDATE posts SET synced_at=updated_at WHERE status='complete'")
@@ -361,9 +363,10 @@ class Database:
 
     def finish_run(self, run_id, status, counts, message=""):
         with self.connect() as c:
-            c.execute("""UPDATE runs SET status=?,downloaded=?,skipped=?,failed=?,message=?,
+            c.execute("""UPDATE runs SET status=?,downloaded=?,skipped=?,ignored=?,failed=?,message=?,
                          finished_at=CURRENT_TIMESTAMP WHERE id=?""",
-                      (status, counts["downloaded"], counts["skipped"], counts["failed"], message[:2000], run_id))
+                      (status, counts["downloaded"], counts["skipped"], counts.get("ignored", 0),
+                       counts["failed"], message[:2000], run_id))
 
     def add_run_log(self, run_id, level, source, message):
         with self.connect() as c:
