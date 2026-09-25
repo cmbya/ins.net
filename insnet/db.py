@@ -435,9 +435,10 @@ class Database:
         for name, column in (("account", "p.account_id"), ("status", "p.status")):
             if filters.get(name):
                 where.append(column+"=?"); args.append(filters[name])
-        for name, column in (("author", "p.username"), ("title", "p.caption")):
-            if filters.get(name):
-                where.append(column+" LIKE ?"); args.append('%'+filters[name]+'%')
+        if filters.get("author"):
+            where.append("p.username=?"); args.append(filters["author"])
+        if filters.get("title"):
+            where.append("p.caption LIKE ?"); args.append('%'+filters["title"]+'%')
         for field in ("synced_at", "published_at"):
             for suffix, op in (("from", ">="), ("to", "<=")):
                 value = filters.get(field+"_"+suffix)
@@ -447,9 +448,19 @@ class Database:
         # The product only synchronizes manually selected creators. Keep legacy
         # saved-list rows in SQLite for migration safety, but omit them from UI.
         where.append("EXISTS(SELECT 1 FROM post_sources s WHERE s.post_id=p.id AND substr(s.source,-6)=':posts')")
+        author_where = ["EXISTS(SELECT 1 FROM post_sources s WHERE s.post_id=p.id AND substr(s.source,-6)=':posts')"]
+        author_args = []
+        if filters.get("account"):
+            author_where.append("p.account_id=?"); author_args.append(filters["account"])
+        author_where.append("p.deleted_at IS NOT NULL" if filters.get("deleted") == "1" else "p.deleted_at IS NULL")
         page, limit = max(1,int(filters.get("page",1))), min(100,max(1,int(filters.get("limit",20))))
         sql = " AND ".join(where)
         with self.connect() as c:
+            authors = [dict(r) for r in c.execute(f"""SELECT p.username,
+                COALESCE(NULLIF(MAX(cr.display_name),''),p.username) AS display_name
+                FROM posts p LEFT JOIN creators cr ON cr.account_id=p.account_id AND cr.username=p.username
+                WHERE {' AND '.join(author_where)} GROUP BY p.username ORDER BY display_name COLLATE NOCASE,p.username""",
+                author_args)]
             total = c.execute(f"SELECT COUNT(*) FROM posts p WHERE {sql}",args).fetchone()[0]
             rows = [dict(r) for r in c.execute(f"""SELECT p.*,COALESCE(NULLIF(a.label,''),a.username) AS account_label,
                 COALESCE(cr.display_name,'') AS display_name FROM posts p JOIN accounts a ON p.account_id=a.id
@@ -458,7 +469,15 @@ class Database:
             for row in rows:
                 row["media"] = [dict(r) for r in c.execute("SELECT * FROM media WHERE post_id=? ORDER BY position",(row["id"],))]
                 row["sources"] = [r[0] for r in c.execute("SELECT source FROM post_sources WHERE post_id=?",(row["id"],))]
-        return {"items":rows,"total":total,"page":page,"limit":limit}
+        return {"items":rows,"total":total,"page":page,"limit":limit,"authors":authors}
+
+    def archive_folder_used(self, relative_folder, excluding_post_id):
+        """Return whether another post already owns media under a relative archive folder."""
+        prefix = str(relative_folder).rstrip("/") + "/"
+        with self.connect() as c:
+            return c.execute("""SELECT 1 FROM media WHERE post_id<>?
+                AND substr(relative_path,1,?)=? LIMIT 1""",
+                (excluding_post_id, len(prefix), prefix)).fetchone() is not None
 
     def hide_records(self, account_id, username=None, ids=None, restore=False):
         # Hide dashboard rows while retaining media paths for next-run file validation. Never unlink media.

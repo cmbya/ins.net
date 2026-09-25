@@ -6,6 +6,7 @@ import re
 import shutil
 import tempfile
 import threading
+import unicodedata
 from pathlib import Path
 from tempfile import TemporaryDirectory
 
@@ -14,6 +15,24 @@ from .engine import GalleryDL, GalleryError
 
 def safe_part(value):
     return re.sub(r"[^A-Za-z0-9._-]", "_", str(value))[:80].strip(".") or "unknown"
+
+
+def safe_title(value, fallback="untitled"):
+    """Keep readable Unicode titles while removing unsafe path and filename characters."""
+    value = unicodedata.normalize("NFC", str(value or ""))
+    value = re.sub(r"[\x00-\x1f\x7f]+", " ", value)
+    value = re.sub(r'[<>:"/\\|?*]+', "_", value)
+    value = " ".join(value.split()).strip(" .")
+    if not value:
+        value = str(fallback or "untitled")
+    # Leave room for dates, carousel indexes, extensions, and UTF-8 byte limits.
+    while len(value.encode("utf-8")) > 150:
+        value = value[:-1]
+    value = value.rstrip(" .") or "untitled"
+    if value.upper() in {"CON", "PRN", "AUX", "NUL", *(f"COM{i}" for i in range(1, 10)),
+                         *(f"LPT{i}" for i in range(1, 10))}:
+        value = "_" + value
+    return value
 
 
 def replace_from_staging(candidate, target):
@@ -102,8 +121,35 @@ class SyncService:
             return "skipped"
         date = re.sub(r"\D", "", post["published_at"] or "")[:8] or "undated"
         folder = (account.get("creator_subdir") or self.db.setting("media_subdir", "Instagram")).strip("/")
-        relative = (Path(folder) if folder else Path()) / safe_part(account["username"]) \
-                   / safe_part(post["username"]) / f"{date}_{safe_part(post['shortcode'])}"
+        base = (Path(folder) if folder else Path()) / safe_part(account["username"]) \
+               / safe_part(post["username"])
+        title = safe_title(post.get("caption"), safe_part(post.get("shortcode", "")))
+        post_folder = base / f"{date}{title}"
+
+        # Keep legacy partial carousels together with their already verified files.
+        legacy_row = next((row for row in rows
+                           if row["relative_path"] and self._archive_path(row["relative_path"]) and
+                           self._file_is_complete(self._archive_path(row["relative_path"]), row.get("size", 0)) and
+                           Path(row["relative_path"]).stem ==
+                           f"{int(row['position']):02d}-{safe_part(row['media_id'])}"), None)
+        if legacy_row:
+            relative = Path(legacy_row["relative_path"]).parent
+            legacy_names = True
+        else:
+            prior_dirs = {Path(row["relative_path"]).parent for row in rows if row["relative_path"]}
+            if post_folder not in prior_dirs and (
+                    (self.archive_root / post_folder).exists() or
+                    self.db.archive_folder_used(post_folder.as_posix(), post_id)):
+                suffix = safe_part(post.get("shortcode", ""))
+                relative = post_folder.with_name(f"{post_folder.name}_{suffix}")
+                counter = 2
+                while ((self.archive_root / relative).exists() or
+                       self.db.archive_folder_used(relative.as_posix(), post_id)):
+                    relative = post_folder.with_name(f"{post_folder.name}_{suffix}_{counter}")
+                    counter += 1
+            else:
+                relative = post_folder
+            legacy_names = False
         self._log(log, "INFO", source,
                   f"下载 @{post['username']}/{post['shortcode']}：缺少 {len(missing)} 个媒体项")
         try:
@@ -117,7 +163,11 @@ class SyncService:
                     extension = safe_part(candidate.suffix.lstrip(".")).lower()
                     if extension not in ("jpg", "jpeg", "png", "webp", "gif", "mp4", "mov", "webm", "mkv"):
                         continue
-                    filename = f"{row['position']:02d}-{safe_part(row['media_id'])}.{extension}"
+                    if legacy_names:
+                        stem = f"{int(row['position']):02d}-{safe_part(row['media_id'])}"
+                    else:
+                        stem = title + (str(int(row["position"])) if len(rows) > 1 else "")
+                    filename = f"{stem}.{extension}"
                     target = (self.archive_root / relative / filename).resolve()
                     target.relative_to(self.archive_root.resolve())
                     target.parent.mkdir(parents=True, exist_ok=True)

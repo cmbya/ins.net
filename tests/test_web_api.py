@@ -82,6 +82,7 @@ class WebApiTests(unittest.TestCase):
 
     def test_dashboard_records_soft_delete_preserve_files_and_logs(self):
         self.db.add_creator(self.account_id, "nasa")
+        self.db.update_creator_profile(self.account_id, "nasa", "NASA Nickname")
         post = {"shortcode":"TEST001", "username":"nasa", "caption":"A test post",
                 "published_at":"2026-09-20T12:00:00", "source_url":"https://www.instagram.com/p/TEST001/",
                 "items":[{"media_id":"101", "position":1, "kind":"image", "extension":"jpg"}]}
@@ -100,6 +101,9 @@ class WebApiTests(unittest.TestCase):
 
         _, records = self.request_json("/api/records?account=" + self.account_id + "&author=nasa")
         self.assertEqual(records["total"], 1)
+        self.assertEqual(records["authors"], [{"username": "nasa", "display_name": "NASA Nickname"}])
+        _, no_partial_author = self.request_json("/api/records?account=" + self.account_id + "&author=nas")
+        self.assertEqual(no_partial_author["total"], 0)
         _, result = self.request_json("/api/records/delete", {"account":self.account_id,"username":"nasa"})
         self.assertEqual(result["count"], 1)
         self.assertTrue(archived.is_file())

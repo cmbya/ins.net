@@ -15,11 +15,11 @@ from insnet.sync import Coordinator, SyncService
 from insnet.web import valid_cookie_file
 
 
-def post(code, username="creator", date="2026-09-01", media_count=1):
+def post(code, username="creator", date="2026-09-01", media_count=1, caption=None):
     return {
         "shortcode": code,
         "username": username,
-        "caption": "caption " + code,
+        "caption": caption if caption is not None else "caption " + code,
         "published_at": date,
         "source_url": f"https://www.instagram.com/p/{code}/",
         "display_name": "Display " + username,
@@ -152,6 +152,80 @@ class ArchiveTests(unittest.TestCase):
             counts, error = service.run(account, "creator", username="creator")
             self.assertEqual(counts["skipped"], 1)
             self.assertEqual(fake.calls, 2)
+
+    def test_single_image_uses_date_title_folder_and_title_filename(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            original = post("TITLE001", date="2026-01-15", caption="大海真蓝\n第二行正文")
+            db, account, fake, archive = self.setup_service(root, FakeGallery([original]))
+            db.add_creator(account["id"], "creator")
+            service = SyncService(db, root, fake, archive_root=archive)
+
+            counts, error = service.run(account, "creator", username="creator")
+
+            self.assertEqual((counts["downloaded"], counts["failed"], error), (1, 0, ""))
+            media = db.posts(account["id"])[0]["media"][0]
+            self.assertEqual(media["relative_path"],
+                             "Instagram/owner/creator/20260115大海真蓝 第二行正文/大海真蓝 第二行正文.jpg")
+            self.assertTrue((archive / media["relative_path"]).is_file())
+
+    def test_carousel_uses_title_with_one_based_media_indexes(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            original = post("TITLE002", date="2026-01-15", media_count=2, caption="大海真蓝")
+            db, account, fake, archive = self.setup_service(root, FakeGallery([original]))
+            db.add_creator(account["id"], "creator")
+            service = SyncService(db, root, fake, archive_root=archive)
+
+            counts, error = service.run(account, "creator", username="creator")
+
+            self.assertEqual((counts["downloaded"], counts["failed"], error), (1, 0, ""))
+            paths = [row["relative_path"] for row in db.posts(account["id"])[0]["media"]]
+            self.assertEqual(paths, [
+                "Instagram/owner/creator/20260115大海真蓝/大海真蓝1.jpg",
+                "Instagram/owner/creator/20260115大海真蓝/大海真蓝2.jpg",
+            ])
+            self.assertTrue(all((archive / path).is_file() for path in paths))
+
+    def test_same_date_and_title_use_shortcode_suffix_to_avoid_overwriting(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            items = [post("SAME001", caption="同一标题"), post("SAME002", caption="同一标题")]
+            db, account, fake, archive = self.setup_service(root, FakeGallery(items))
+            db.add_creator(account["id"], "creator")
+            service = SyncService(db, root, fake, archive_root=archive)
+
+            counts, error = service.run(account, "creator", username="creator")
+
+            self.assertEqual((counts["downloaded"], counts["failed"], error), (2, 0, ""))
+            paths = [row["media"][0]["relative_path"] for row in db.posts(account["id"])]
+            self.assertEqual(set(paths), {
+                "Instagram/owner/creator/20260901同一标题/同一标题.jpg",
+                "Instagram/owner/creator/20260901同一标题_SAME002/同一标题.jpg",
+            })
+
+    def test_partial_legacy_carousel_repair_stays_in_existing_folder(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            original = post("LEGACY", date="2026-09-01", media_count=2, caption="新标题")
+            db, account, fake, archive = self.setup_service(root, FakeGallery([original]))
+            db.add_creator(account["id"], "creator")
+            post_id = db.upsert_post(account["id"], original, "creator:creator:posts")
+            kept = archive / "Instagram" / "owner" / "creator" / "20260901_LEGACY" / "01-LEGACY-1.jpg"
+            kept.parent.mkdir(parents=True)
+            kept.write_bytes(b"existing media")
+            db.set_media_file(post_id, "LEGACY-1", str(kept.relative_to(archive)), kept.stat().st_size, "jpg")
+            db.set_post_status(post_id, "partial")
+            service = SyncService(db, root, fake, archive_root=archive)
+
+            counts, error = service.run(account, "creator", username="creator")
+
+            self.assertEqual((counts["downloaded"], counts["failed"], error), (1, 0, ""))
+            paths = [row["relative_path"] for row in db.posts(account["id"])[0]["media"]]
+            self.assertEqual(paths, [
+                "Instagram/owner/creator/20260901_LEGACY/01-LEGACY-1.jpg",
+                "Instagram/owner/creator/20260901_LEGACY/02-LEGACY-2.jpg",
+            ])
 
     def test_creator_download_cap_is_per_cycle_and_completed_posts_are_skipped(self):
         with tempfile.TemporaryDirectory() as temporary:
