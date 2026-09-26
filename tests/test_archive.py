@@ -341,30 +341,91 @@ class ArchiveTests(unittest.TestCase):
             self.assertEqual(args[0:2], ["--filter", "media_id in ('CAROUSEL-2',)"])
             self.assertIn("https://www.instagram.com/p/CAROUSEL/", args)
 
-    def test_all_history_cursor_advances_in_bounded_batches(self):
+    def test_all_history_restarts_at_latest_and_skips_already_archived_posts(self):
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
-            head = [post("NEW1", date="2026-09-20")]
-            fake = FakeGallery(head)
-            fake.history_responses[None] = ([post("OLD1", date="2024-01-01")], "cursor-B")
+            fake = FakeGallery()
+            first_page = [post("NEW1", date="2026-09-20"), post("OLD1", date="2024-01-01")]
+            fake.history_responses[None] = (first_page, "cursor-B")
             fake.history_responses["cursor-B"] = ([post("OLD2", date="2023-01-01")], None)
             db, account, fake, archive = self.setup_service(root, fake)
             db.add_creator(account["id"], "creator")
             db.set_creator(account["id"], "creator", sync_mode="all")
             db.save_admin_config({"creator_interval":360,"creator_max":1,"scheduler_enabled":1,"log_days":30})
             service = SyncService(db, root, fake, archive_root=archive)
+            service._pause_history_scan = lambda: None
+
             first, _ = service.run(account, "creator", username="creator")
             self.assertEqual(first["downloaded"], 1)
-            self.assertEqual(db.creator(account["id"], "creator")["scan_cursor"], "cursor-B")
             second, _ = service.run(account, "creator", username="creator")
+            third, _ = service.run(account, "creator", username="creator")
             creator = db.creator(account["id"], "creator")
             self.assertEqual(creator["scan_cursor"], None)
-            self.assertEqual(creator["history_complete"], 1)
-            history_requests = [(size, cursor) for _, size, cursor in fake.scan_requests if size == 31]
-            self.assertEqual(history_requests, [(31, None), (31, "cursor-B")])
+            self.assertEqual(creator["history_complete"], 0)
+            history_requests = [(size, cursor) for _, size, cursor in fake.scan_requests]
+            self.assertEqual(history_requests, [
+                (31, None),
+                (31, None),
+                (31, None), (31, "cursor-B"),
+            ])
             self.assertEqual(len(db.posts(account["id"])), 3)
-            self.assertLessEqual(first["downloaded"] + second["downloaded"], 2)
-            self.assertTrue(any(item["status"] == "pending" for item in db.posts(account["id"])))
+            self.assertEqual(first["downloaded"] + second["downloaded"] + third["downloaded"], 3)
+            self.assertTrue(all(item["status"] == "complete" for item in db.posts(account["id"])))
+
+    def test_all_history_finds_unrecorded_older_posts_after_archived_pages(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            grid_url = "https://www.instagram.com/creator/posts/"
+            existing = [post(f"ARCH{i}", date="2024-01-01") for i in range(1, 5)]
+            missing = [post(f"MISSING{i}", date="2023-01-01") for i in range(1, 3)]
+            fake = FakeGallery()
+            fake.history_responses[(grid_url, None)] = (existing[:2], "cursor-A")
+            fake.history_responses[(grid_url, "cursor-A")] = (existing[2:] , "cursor-B")
+            fake.history_responses[(grid_url, "cursor-B")] = (missing, None)
+            db, account, fake, archive = self.setup_service(root, fake)
+            db.add_creator(account["id"], "creator")
+            db.set_creator(account["id"], "creator", sync_mode="all")
+            service = SyncService(db, root, fake, archive_root=archive)
+            service._pause_history_scan = lambda: None
+
+            for item in existing:
+                service._persist_scan(account, [item], "creator:creator:posts", "creator")
+                self.assertEqual(service._archive(account, item, "creator:creator:posts"), "downloaded")
+
+            counts, error = service.run(account, "creator", username="creator")
+
+            self.assertEqual(error, "")
+            self.assertEqual(counts["downloaded"], 2)
+            self.assertEqual(counts["skipped"], 4)
+            self.assertEqual(counts["failed"], 0)
+            self.assertEqual(len(db.posts(account["id"])), 6)
+            self.assertTrue(all(
+                next(item for item in db.posts(account["id"]) if item["shortcode"] == code)["status"] == "complete"
+                for code in ("MISSING1", "MISSING2")
+            ))
+            self.assertEqual(db.creator(account["id"], "creator")["history_complete"], 0)
+
+    def test_all_history_does_not_mark_a_full_page_complete_without_cursor(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            grid_url = "https://www.instagram.com/creator/posts/"
+            fake = FakeGallery()
+            fake.history_responses[(grid_url, None)] = (
+                [post(f"FULL{i}") for i in range(31)], None,
+            )
+            db, account, fake, archive = self.setup_service(root, fake)
+            db.add_creator(account["id"], "creator")
+            db.set_creator(account["id"], "creator", sync_mode="all")
+            service = SyncService(db, root, fake, archive_root=archive)
+
+            counts, error = service.run(account, "creator", username="creator")
+
+            state = db.creator(account["id"], "creator")
+            self.assertEqual(counts["downloaded"], 20)
+            self.assertEqual(counts["failed"], 1)
+            self.assertIn("无法确认历史已到末尾", error)
+            self.assertEqual(state["scan_cursor"], None)
+            self.assertEqual(state["history_complete"], 0)
 
     def test_only_manual_creator_is_scheduled_and_post_feed_has_no_reels(self):
         with tempfile.TemporaryDirectory() as temporary:
@@ -458,33 +519,39 @@ class ArchiveTests(unittest.TestCase):
                                 for message in messages))
             self.assertTrue(any("两类合计实际下载 1 条唯一作品" in message for message in messages))
 
-    def test_all_history_keeps_independent_posts_and_reels_cursors(self):
+    def test_all_history_starts_each_selected_category_from_its_latest_page(self):
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
             grid_url = "https://www.instagram.com/creator/posts/"
             reels_url = "https://www.instagram.com/creator/reels/"
             reel = post("REELHIST")
             reel["source_url"] = "https://www.instagram.com/reel/REELHIST/"
-            fake = FakeGallery([post("GRIDHEAD")])
-            fake.posts_by_url = {grid_url: [post("GRIDHEAD")], reels_url: [reel]}
-            fake.history_responses[(grid_url, None)] = ([post("GRIDOLD")], "posts-next")
+            grid = post("GRIDHEAD")
+            fake = FakeGallery()
+            fake.history_responses[(grid_url, None)] = ([grid], "posts-next")
+            fake.history_responses[(grid_url, "posts-next")] = ([], None)
             fake.history_responses[(reels_url, None)] = ([reel], "reels-next")
             db, account, fake, archive = self.setup_service(root, fake)
             db.add_creator(account["id"], "creator", ["posts", "reels"])
             db.set_creator(account["id"], "creator", sync_mode="all")
             db.save_admin_config({"creator_interval":360,"creator_max":1,"scheduler_enabled":1,"log_days":30})
             service = SyncService(db, root, fake, archive_root=archive)
+            service._pause_history_scan = lambda: None
+            service._persist_scan(account, [grid], "creator:creator:posts", "creator")
+            self.assertEqual(service._archive(account, grid, "creator:creator:posts"), "downloaded")
 
             counts, _ = service.run(account, "creator", username="creator")
 
             state = db.creator(account["id"], "creator")
             self.assertEqual(counts["downloaded"], 1)
-            self.assertEqual(state["scan_cursor"], "posts-next")
-            self.assertEqual(state["reels_scan_cursor"], "reels-next")
+            self.assertEqual(state["scan_cursor"], None)
+            self.assertEqual(state["reels_scan_cursor"], None)
             self.assertEqual(state["history_complete"], 0)
             self.assertEqual(state["reels_history_complete"], 0)
             history_calls = [(url, cursor) for url, size, cursor in fake.scan_requests if size == 31]
-            self.assertEqual(history_calls, [(grid_url, None), (reels_url, None)])
+            self.assertEqual(history_calls, [
+                (grid_url, None), (grid_url, "posts-next"), (reels_url, None),
+            ])
 
     def test_archive_copies_across_mounts_before_atomic_replace(self):
         with tempfile.TemporaryDirectory() as temporary:
