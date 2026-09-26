@@ -14,8 +14,11 @@ CREATE TABLE IF NOT EXISTS creators (
     full_sync INTEGER NOT NULL DEFAULT 0, manual INTEGER NOT NULL DEFAULT 1,
     last_sync TEXT, display_name TEXT NOT NULL DEFAULT '', avatar_url TEXT NOT NULL DEFAULT '',
     profile_id TEXT NOT NULL DEFAULT '', sync_mode TEXT NOT NULL DEFAULT 'recent20',
+    sync_types TEXT NOT NULL DEFAULT 'posts', sync_turn TEXT NOT NULL DEFAULT 'posts',
     interval_minutes INTEGER NOT NULL DEFAULT 360, max_per_run INTEGER NOT NULL DEFAULT 20,
     scan_cursor TEXT, history_complete INTEGER NOT NULL DEFAULT 0,
+    reels_scan_cursor TEXT, reels_history_complete INTEGER NOT NULL DEFAULT 0,
+    reels_verify_cursor INTEGER NOT NULL DEFAULT 0,
     next_sync_at TEXT, last_error TEXT NOT NULL DEFAULT '', failures INTEGER NOT NULL DEFAULT 0,
     PRIMARY KEY (account_id, username)
 );
@@ -71,11 +74,16 @@ class Database:
         "avatar_url": "TEXT NOT NULL DEFAULT ''",
         "profile_id": "TEXT NOT NULL DEFAULT ''",
         "sync_mode": "TEXT NOT NULL DEFAULT 'recent20'",
+        "sync_types": "TEXT NOT NULL DEFAULT 'posts'",
+        "sync_turn": "TEXT NOT NULL DEFAULT 'posts'",
         "interval_minutes": "INTEGER NOT NULL DEFAULT 360",
         "max_per_run": "INTEGER NOT NULL DEFAULT 20",
         "scan_cursor": "TEXT",
         "history_complete": "INTEGER NOT NULL DEFAULT 0",
         "verify_cursor": "INTEGER NOT NULL DEFAULT 0",
+        "reels_scan_cursor": "TEXT",
+        "reels_history_complete": "INTEGER NOT NULL DEFAULT 0",
+        "reels_verify_cursor": "INTEGER NOT NULL DEFAULT 0",
         "next_sync_at": "TEXT",
         "last_error": "TEXT NOT NULL DEFAULT ''",
         "failures": "INTEGER NOT NULL DEFAULT 0",
@@ -159,11 +167,30 @@ class Database:
             rows = c.execute("""SELECT c.*,
                 (SELECT COUNT(DISTINCT p.id) FROM posts p JOIN post_sources s ON s.post_id=p.id
                  WHERE p.account_id=c.account_id AND s.source='creator:'||c.username||':posts'
+                   AND p.status='complete' AND p.deleted_at IS NULL) AS archived_posts_count,
+                (SELECT COUNT(DISTINCT p.id) FROM posts p JOIN post_sources s ON s.post_id=p.id
+                 WHERE p.account_id=c.account_id AND s.source='creator:'||c.username||':reels'
+                   AND p.status='complete' AND p.deleted_at IS NULL) AS archived_reels_count,
+                (SELECT COUNT(DISTINCT p.id) FROM posts p JOIN post_sources s ON s.post_id=p.id
+                 WHERE p.account_id=c.account_id AND s.source IN
+                   ('creator:'||c.username||':posts','creator:'||c.username||':reels')
                    AND p.status='complete' AND p.deleted_at IS NULL) AS archived_count
                 FROM creators c WHERE c.account_id=? AND c.manual=1 ORDER BY c.enabled DESC,c.username""",
                               (account_id,)).fetchall()
-            return [{key: value for key, value in dict(x).items()
-                     if key not in ("interval_minutes", "max_per_run")} for x in rows]
+            result = []
+            for row in rows:
+                item = {key: value for key, value in dict(row).items()
+                        if key not in ("interval_minutes", "max_per_run")}
+                item["sync_types"] = self._parse_sync_types(item.get("sync_types", "posts"))
+                result.append(item)
+            return result
+
+    @staticmethod
+    def _parse_sync_types(value):
+        allowed = ("posts", "reels")
+        selected = list(dict.fromkeys(item for item in str(value or "posts").split(",")
+                                      if item in allowed))
+        return selected or ["posts"]
 
     def creator(self, account_id, username):
         with self.connect() as c:
@@ -171,24 +198,40 @@ class Database:
                             (account_id, username)).fetchone()
             return dict(row) if row else None
 
-    def add_creator(self, account_id, username):
+    def add_creator(self, account_id, username, sync_types=None):
         interval = int(self.setting("creator_interval", "360"))
         maximum = int(self.setting("creator_max", "20"))
+        selected = self._parse_sync_types(",".join(sync_types) if isinstance(sync_types, (list, tuple))
+                                          else sync_types or "posts")
+        sync_types_value = ",".join(sorted(selected))
+        sync_turn = "posts" if "posts" in selected else "reels"
         with self.connect() as c:
-            c.execute("""INSERT INTO creators(account_id,username,manual,enabled,next_sync_at,interval_minutes,max_per_run)
-                         VALUES(?,?,1,1,CURRENT_TIMESTAMP,?,?)
+            c.execute("""INSERT INTO creators(account_id,username,manual,enabled,next_sync_at,interval_minutes,max_per_run,sync_types,sync_turn)
+                         VALUES(?,?,1,1,CURRENT_TIMESTAMP,?,?,?,?)
                          ON CONFLICT(account_id,username) DO UPDATE SET manual=1,enabled=1,
                          interval_minutes=excluded.interval_minutes,max_per_run=excluded.max_per_run,
+                         sync_types=excluded.sync_types,
+                         sync_turn=CASE WHEN instr(excluded.sync_types,creators.sync_turn)=0
+                                        THEN excluded.sync_turn ELSE creators.sync_turn END,
                          next_sync_at=CURRENT_TIMESTAMP""",
-                      (account_id, username, interval, maximum))
+                      (account_id, username, interval, maximum, sync_types_value, sync_turn))
 
-    def set_creator(self, account_id, username, *, enabled=None, sync_mode=None):
+    def set_creator(self, account_id, username, *, enabled=None, sync_mode=None, sync_types=None):
         fields, values = [], []
         for field, value in (("enabled", enabled), ("sync_mode", sync_mode)):
             if value is not None:
                 fields.append(f"{field}=?")
                 values.append(int(value) if field == "enabled" else value)
+        if sync_types is not None:
+            selected = self._parse_sync_types(",".join(sync_types) if isinstance(sync_types, (list, tuple))
+                                              else sync_types)
+            sync_types_value = ",".join(sorted(selected))
+            sync_turn = "posts" if "posts" in selected else "reels"
+            fields.extend(("sync_types=?", "sync_turn=CASE WHEN instr(?,sync_turn)=0 THEN ? ELSE sync_turn END"))
+            values.extend((sync_types_value, sync_types_value, sync_turn))
         if enabled is True:
+            fields.append("next_sync_at=CURRENT_TIMESTAMP")
+        if sync_types is not None:
             fields.append("next_sync_at=CURRENT_TIMESTAMP")
         if not fields:
             return False
@@ -207,15 +250,27 @@ class Database:
                       (display_name, display_name, avatar_url, avatar_url, profile_id, profile_id,
                        account_id, username))
 
-    def update_creator_scan(self, account_id, username, cursor, history_complete):
+    def update_creator_scan(self, account_id, username, cursor, history_complete, category="posts"):
+        cursor_column, complete_column = {
+            "posts": ("scan_cursor", "history_complete"),
+            "reels": ("reels_scan_cursor", "reels_history_complete"),
+        }[category]
         with self.connect() as c:
-            c.execute("UPDATE creators SET scan_cursor=?,history_complete=? WHERE account_id=? AND username=?",
+            c.execute(f"UPDATE creators SET {cursor_column}=?,{complete_column}=? WHERE account_id=? AND username=?",
                       (cursor, int(history_complete), account_id, username))
 
-    def update_creator_verify_cursor(self, account_id, username, cursor):
+    def update_creator_verify_cursor(self, account_id, username, cursor, category="posts"):
+        column = {"posts": "verify_cursor", "reels": "reels_verify_cursor"}[category]
         with self.connect() as c:
-            c.execute("UPDATE creators SET verify_cursor=? WHERE account_id=? AND username=?",
+            c.execute(f"UPDATE creators SET {column}=? WHERE account_id=? AND username=?",
                       (int(cursor), account_id, username))
+
+    def set_creator_sync_turn(self, account_id, username, category):
+        if category not in ("posts", "reels"):
+            raise ValueError("同步类型无效")
+        with self.connect() as c:
+            c.execute("UPDATE creators SET sync_turn=? WHERE account_id=? AND username=?",
+                      (category, account_id, username))
 
     def mark_creator_sync(self, account_id, username, error="", rate_limited=False):
         with self.connect() as c:
@@ -238,8 +293,8 @@ class Database:
                               (account_id,)).fetchone()
             return dict(row) if row else None
 
-    def creator_pending_posts(self, account_id, username):
-        source = f"creator:{username}:posts"
+    def creator_pending_posts(self, account_id, username, category="posts"):
+        source = f"creator:{username}:{category}"
         with self.connect() as c:
             posts = [dict(x) for x in c.execute("""SELECT p.* FROM posts p JOIN post_sources s ON s.post_id=p.id
                     WHERE p.account_id=? AND s.source=? AND p.status<>'complete' AND p.deleted_at IS NULL
@@ -251,8 +306,8 @@ class Database:
                     (post["id"],))]
             return posts
 
-    def creator_complete_posts(self, account_id, username, after_id=0, limit=50):
-        source = f"creator:{username}:posts"
+    def creator_complete_posts(self, account_id, username, after_id=0, limit=50, category="posts"):
+        source = f"creator:{username}:{category}"
         with self.connect() as c:
             posts = [dict(x) for x in c.execute("""SELECT p.* FROM posts p JOIN post_sources s ON s.post_id=p.id
                     WHERE p.account_id=? AND s.source=? AND p.status='complete'
@@ -415,7 +470,8 @@ class Database:
     def dashboard(self, account_id=""):
         clause, args = (" AND p.account_id=?", [account_id]) if account_id else ("", [])
         where = ("p.status='complete' AND p.deleted_at IS NULL "
-                 "AND EXISTS(SELECT 1 FROM post_sources s WHERE s.post_id=p.id AND substr(s.source,-6)=':posts')") + clause
+                 "AND EXISTS(SELECT 1 FROM post_sources s WHERE s.post_id=p.id "
+                 "AND substr(s.source,-6) IN (':posts',':reels'))") + clause
         with self.connect() as c:
             total = c.execute(f"SELECT COUNT(*) FROM posts p WHERE {where}", args).fetchone()[0]
             size = c.execute(f"SELECT COALESCE(SUM(m.size),0) FROM media m JOIN posts p ON p.id=m.post_id WHERE {where}", args).fetchone()[0]
@@ -447,8 +503,8 @@ class Database:
         where.append("p.deleted_at IS NOT NULL" if filters.get("deleted") == "1" else "p.deleted_at IS NULL")
         # The product only synchronizes manually selected creators. Keep legacy
         # saved-list rows in SQLite for migration safety, but omit them from UI.
-        where.append("EXISTS(SELECT 1 FROM post_sources s WHERE s.post_id=p.id AND substr(s.source,-6)=':posts')")
-        author_where = ["EXISTS(SELECT 1 FROM post_sources s WHERE s.post_id=p.id AND substr(s.source,-6)=':posts')"]
+        where.append("EXISTS(SELECT 1 FROM post_sources s WHERE s.post_id=p.id AND substr(s.source,-6) IN (':posts',':reels'))")
+        author_where = ["EXISTS(SELECT 1 FROM post_sources s WHERE s.post_id=p.id AND substr(s.source,-6) IN (':posts',':reels'))"]
         author_args = []
         if filters.get("account"):
             author_where.append("p.account_id=?"); author_args.append(filters["account"])

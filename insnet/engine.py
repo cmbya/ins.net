@@ -35,7 +35,7 @@ def redact_output(value, cookie_path):
     return re.sub(r"\x1b\[[0-9;]*m", "", text).strip()[-5000:]
 
 
-def normalize_messages(messages):
+def normalize_messages(messages, category="posts"):
     """Group URL messages by Instagram shortcode; retain carousel item order."""
     groups = OrderedDict()
     directory = {}
@@ -77,7 +77,7 @@ def normalize_messages(messages):
                 "published_at": str(date)[:32] if date else None,
                 "source_url": (meta.get("post_url") if str(meta.get("post_url", "")).startswith(
                     ("https://www.instagram.com/p/", "https://www.instagram.com/reel/"))
-                    else f"https://www.instagram.com/p/{shortcode}/"),
+                    else f"https://www.instagram.com/{'reel' if category == 'reels' else 'p'}/{shortcode}/"),
                 "display_name": display_name, "avatar_url": avatar_url, "profile_id": profile_id,
                 "items": [],
             }
@@ -134,14 +134,16 @@ class GalleryDL:
 
     def posts(self, cookie_path, url, max_posts=None):
         messages, _ = self._json(cookie_path, url, max_posts)
-        return normalize_messages(messages)
+        category = "reels" if re.search(r"/reels/?$", url) else "posts"
+        return normalize_messages(messages, category)
 
     def scan_posts(self, cookie_path, url, max_posts=None, cursor=None):
         """Fetch one bounded page and return gallery-dl's Instagram continuation cursor."""
         messages, stderr = self._json(cookie_path, url, max_posts, cursor=cursor, verbose=True)
         matches = re.findall(r"\bCursor:\s*([^\s]+)", stderr, flags=re.IGNORECASE)
         next_cursor = matches[-1] if matches else None
-        return normalize_messages(messages), next_cursor
+        category = "reels" if re.search(r"/reels/?$", url) else "posts"
+        return normalize_messages(messages, category), next_cursor
 
     def download(self, cookie_path, post, staging, media_ids=None):
         staging = Path(staging)

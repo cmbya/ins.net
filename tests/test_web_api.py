@@ -60,6 +60,7 @@ class WebApiTests(unittest.TestCase):
         self.assertEqual(code, 200)
         self.assertEqual(creators[0]["username"], "nasa")
         self.assertEqual(creators[0]["sync_mode"], "recent20")
+        self.assertEqual(creators[0]["sync_types"], ["posts"])
         self.assertNotIn("interval_minutes", creators[0])
         self.assertNotIn("max_per_run", creators[0])
 
@@ -78,6 +79,27 @@ class WebApiTests(unittest.TestCase):
             "account": self.account_id, "username": "nasa", "mode": "list"})
         self.assertEqual(self.db.creator(self.account_id, "nasa")["manual"], 2)
         self.assertNotIn("nasa", [c["username"] for c in self.db.creators(self.account_id)])
+
+    def test_creator_api_accepts_posts_reels_or_both(self):
+        self.request_json("/api/creators", {
+            "account": self.account_id, "username": "mixed", "sync_types": ["posts", "reels"]})
+        creator = self.db.creator(self.account_id, "mixed")
+        self.assertEqual(creator["sync_types"], "posts,reels")
+        self.request_json("/api/creator", {
+            "account": self.account_id, "username": "mixed", "sync_types": ["reels"]})
+        self.assertEqual(self.db.creator(self.account_id, "mixed")["sync_types"], "reels")
+        listed = self.request_json("/api/creators?account=" + self.account_id)[1]
+        self.assertEqual(next(row for row in listed if row["username"] == "mixed")["sync_types"],
+                         ["reels"])
+        with self.assertRaises(HTTPError) as error:
+            self.request_json("/api/creator", {
+                "account": self.account_id, "username": "mixed", "sync_types": []})
+        self.assertEqual(error.exception.code, 400)
+        with self.assertRaises(HTTPError) as error:
+            self.request_json("/api/creator", {
+                "account": self.account_id, "username": "mixed",
+                "sync_types": ["posts", "posts"]})
+        self.assertEqual(error.exception.code, 400)
 
 
     def test_dashboard_records_soft_delete_preserve_files_and_logs(self):
@@ -214,16 +236,19 @@ class WebApiTests(unittest.TestCase):
             self.coordinator.start(self.account_id, "saved")
         self.assertEqual(self.db.post(post_id)["status"], "complete")
 
-    def test_legacy_reel_only_rows_do_not_appear_in_post_statistics(self):
+    def test_reels_are_included_in_statistics_and_sync_records(self):
         self.db.add_creator(self.account_id, "nasa")
         reel = {"shortcode":"LEGREEL", "username":"nasa", "caption":"Legacy reel",
                 "published_at":"2026-09-20T12:00:00", "source_url":"https://www.instagram.com/reel/LEGREEL/",
                 "items":[{"media_id":"r101", "position":1, "kind":"video", "extension":"mp4"}]}
         post_id = self.db.upsert_post(self.account_id, reel, "creator:nasa:reels")
         self.db.set_post_status(post_id, "complete")
-        self.assertEqual(self.db.dashboard(self.account_id)["total"], 0)
-        self.assertEqual(self.db.records({"account":self.account_id})["total"], 0)
-        self.assertEqual(self.db.creators(self.account_id)[0]["archived_count"], 0)
+        self.assertEqual(self.db.dashboard(self.account_id)["total"], 1)
+        self.assertEqual(self.db.records({"account":self.account_id})["total"], 1)
+        creator = self.db.creators(self.account_id)[0]
+        self.assertEqual(creator["archived_count"], 1)
+        self.assertEqual(creator["archived_reels_count"], 1)
+        self.assertEqual(creator["archived_posts_count"], 0)
 
     def test_removed_creator_cannot_be_started_by_direct_sync_request(self):
         self.db.add_creator(self.account_id, "nasa")

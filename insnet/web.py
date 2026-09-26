@@ -23,7 +23,7 @@ from .sync import Coordinator, SyncService
 
 
 STATIC = Path(__file__).resolve().parent.parent / "static"
-APP_VERSION = "0.7.5"
+APP_VERSION = "0.7.6"
 
 
 def valid_cookie_file(value):
@@ -290,7 +290,12 @@ class Handler(BaseHTTPRequestHandler):
                 name = str(value.get("username", "")).strip().lower().lstrip("@")
                 if not USERNAME.fullmatch(name):
                     raise ValueError("博主用户名无效")
-                self.server.db.add_creator(account_id, name)
+                sync_types = value.get("sync_types", ["posts"])
+                if (not isinstance(sync_types, list) or not sync_types
+                        or any(item not in ("posts", "reels") for item in sync_types)
+                        or len(set(sync_types)) != len(sync_types)):
+                    raise ValueError("请选择帖子网格、Reels，或同时选择两者")
+                self.server.db.add_creator(account_id, name, sync_types)
                 return self.reply(201, {"ok": True})
             if path == "/api/creator":
                 name = str(value.get("username", ""))
@@ -298,12 +303,18 @@ class Handler(BaseHTTPRequestHandler):
                     raise ValueError("博主参数无效")
                 enabled = value.get("enabled")
                 sync_mode = value.get("sync_mode")
+                sync_types = value.get("sync_types")
                 if enabled is not None and not isinstance(enabled, bool):
                     raise ValueError("自动同步开关无效")
                 if sync_mode is not None and sync_mode not in ("recent20", "all"):
                     raise ValueError("同步范围无效")
+                if (sync_types is not None and
+                        (not isinstance(sync_types, list) or not sync_types
+                         or any(item not in ("posts", "reels") for item in sync_types)
+                         or len(set(sync_types)) != len(sync_types))):
+                    raise ValueError("请选择帖子网格、Reels，或同时选择两者")
                 if not self.server.db.set_creator(account_id, name, enabled=enabled,
-                                                 sync_mode=sync_mode):
+                                                 sync_mode=sync_mode, sync_types=sync_types):
                     raise ValueError("博主不存在")
                 return self.reply(200, {"ok": True})
             if path == "/api/creator/delete":

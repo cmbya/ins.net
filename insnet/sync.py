@@ -230,12 +230,20 @@ class SyncService:
                                   self._file_is_complete(self._archive_path(row["relative_path"]), row.get("size", 0))
                                   for row in rows)
 
-    def _download_batch(self, account, source, posts, max_per_run=None, log=None):
+    def _download_batch(self, account, source, posts, max_per_run=None, log=None,
+                        shared_budget=None, processed=None):
         counts = {"downloaded": 0, "skipped": 0, "failed": 0}
         attempts = 0
+        duplicates = 0
         scanned_skips = 0
         cleared_file_skips = 0
         for post in posts:
+            shortcode = post["shortcode"]
+            if processed is not None and shortcode in processed:
+                duplicates += 1
+                continue
+            if processed is not None:
+                processed.add(shortcode)
             stored = self.db.post(post['id'])
             was_cleared = bool(stored and stored.get("deleted_at"))
             if not was_cleared and post.get("status") == "complete" and not post.get("scanned_this_run"):
@@ -247,7 +255,8 @@ class SyncService:
                 scanned_skips += bool(post.get("scanned_this_run"))
                 cleared_file_skips += bool(was_cleared)
                 continue
-            if max_per_run is not None and attempts >= max_per_run:
+            if (shared_budget is not None and shared_budget["remaining"] <= 0) or (
+                    max_per_run is not None and attempts >= max_per_run):
                 continue
             if was_cleared:
                 # A cleared record is only hidden while its files remain intact.
@@ -256,6 +265,8 @@ class SyncService:
                 self._log(log, "INFO", source,
                           f"恢复 {post['shortcode']} 的作品记录：本地媒体缺失，将重新下载缺少的项目")
             attempts += 1
+            if shared_budget is not None:
+                shared_budget["remaining"] -= 1
             result = self._archive(account, post, source, log, allow_legacy_restore=not was_cleared)
             counts[result] += 1
         if counts["skipped"]:
@@ -263,30 +274,35 @@ class SyncService:
                       f"跳过 {counts['skipped']} 条：本轮扫描且归档文件完整 {scanned_skips} 条，"
                       f"其中清除记录后文件仍在 {cleared_file_skips} 条；未扫描的完整状态记录 "
                       f"{counts['skipped'] - scanned_skips} 条")
-        queued = max(0, len(posts) - attempts - counts["skipped"])
+        queued = max(0, len(posts) - duplicates - attempts - counts["skipped"])
         if queued:
             self._log(log, "INFO", source,
                       f"达到本轮下载上限；还有 {queued} 条待下载，将在后续同步继续")
         return counts
 
-    def _run_creator(self, account, creator, log=None):
+    def _run_creator_category(self, account, creator, category, shared_budget, processed, log=None):
         account_id, name = account["id"], creator["username"]
-        source = f"creator:{name}:posts"
-        url = f"https://www.instagram.com/{name}/posts/"
+        source = f"creator:{name}:{category}"
+        url = f"https://www.instagram.com/{name}/{'posts' if category == 'posts' else 'reels'}/"
         mode = creator["sync_mode"]
-        max_per_run = int(creator["max_per_run"])
+        content_label = "帖子网格" if category == "posts" else "Reels"
+        history_cursor_key = "scan_cursor" if category == "posts" else "reels_scan_cursor"
+        history_complete_key = "history_complete" if category == "posts" else "reels_history_complete"
+        verify_cursor_key = "verify_cursor" if category == "posts" else "reels_verify_cursor"
         self._log(log, "INFO", source,
-                  f"开始同步 @{name}：{'最新 20 条' if mode == 'recent20' else '全部历史分批扫描'}，本轮最多下载 {max_per_run} 条")
+                  f"开始同步 @{name} 的{content_label}："
+                  f"{'最新 20 条' if mode == 'recent20' else '全部历史分批扫描'}，"
+                  f"本博主本轮下载上限 {shared_budget['limit']} 条（帖子网格与 Reels 合计）")
         # Snapshot the unfinished queue before the new metadata scan inserts its
         # discoveries. This lets the batch finish queued work before extending it.
-        backlog = self.db.creator_pending_posts(account_id, name)
+        backlog = self.db.creator_pending_posts(account_id, name, category)
         recent, _ = self._scan(account, url, 20)
         self._persist_scan(account, recent, source, name)
-        self._log(log, "INFO", source, f"最新内容读取完成：{len(recent)} 条帖子")
+        self._log(log, "INFO", source, f"最新内容读取完成：{len(recent)} 条{content_label}作品")
 
         scanned = list(recent)
-        next_cursor = creator.get("scan_cursor")
-        history_complete = bool(creator.get("history_complete"))
+        next_cursor = creator.get(history_cursor_key)
+        history_complete = bool(creator.get(history_complete_key))
         if mode == "all" and not history_complete:
             previous_cursor = next_cursor
             history, next_cursor = self._scan(account, url, 31, cursor=previous_cursor)
@@ -295,9 +311,9 @@ class SyncService:
             history_complete = next_cursor is None
             if next_cursor == previous_cursor and previous_cursor is not None:
                 raise GalleryError("历史扫描游标没有前进，已暂停本轮，避免重复扫描")
-            self.db.update_creator_scan(account_id, name, next_cursor, history_complete)
+            self.db.update_creator_scan(account_id, name, next_cursor, history_complete, category)
             state = "历史已经扫描完毕" if history_complete else "历史扫描进度已保存，下一轮从此处继续"
-            self._log(log, "INFO", source, f"本轮读取 {len(history)} 条历史帖子；{state}")
+            self._log(log, "INFO", source, f"本轮读取 {len(history)} 条历史{content_label}作品；{state}")
 
         # Current page and persisted backlog are merged by shortcode. Complete
         # records are cheap skips; pending items precede partial failures so one
@@ -311,11 +327,13 @@ class SyncService:
 
         # Check a bounded page of complete records every run. This catches files
         # removed or truncated on disk, even when the post is outside recent20.
-        verify_cursor = int(creator.get("verify_cursor") or 0)
-        archived = self.db.creator_complete_posts(account_id, name, verify_cursor, limit=50)
+        verify_cursor = int(creator.get(verify_cursor_key) or 0)
+        archived = self.db.creator_complete_posts(account_id, name, verify_cursor, limit=50,
+                                                  category=category)
         if not archived and verify_cursor:
             verify_cursor = 0
-            archived = self.db.creator_complete_posts(account_id, name, 0, limit=50)
+            archived = self.db.creator_complete_posts(account_id, name, 0, limit=50,
+                                                      category=category)
         repaired_candidates = 0
         for post in archived:
             if not self._locally_complete(post, source, log):
@@ -326,7 +344,7 @@ class SyncService:
                 by_shortcode[post["shortcode"]] = post
                 repaired_candidates += 1
         next_verify_cursor = archived[-1]["id"] if len(archived) == 50 else 0
-        self.db.update_creator_verify_cursor(account_id, name, next_verify_cursor)
+        self.db.update_creator_verify_cursor(account_id, name, next_verify_cursor, category)
         self._log(log, "INFO", source,
                   f"归档完整性抽查 {len(archived)} 条；发现需补齐 {repaired_candidates} 条")
 
@@ -339,7 +357,39 @@ class SyncService:
             1 if p.get("queued_before_run") else 2,
             int(p.get("id") or 0),
         ))
-        counts = self._download_batch(account, source, candidates, max_per_run, log)
+        return self._download_batch(account, source, candidates, log=log,
+                                    shared_budget=shared_budget, processed=processed)
+
+    def _run_creator(self, account, creator, log=None):
+        account_id, name = account["id"], creator["username"]
+        categories = self.db._parse_sync_types(creator.get("sync_types", "posts"))
+        turn = creator.get("sync_turn", "posts")
+        if turn in categories:
+            start_at = categories.index(turn)
+            categories = categories[start_at:] + categories[:start_at]
+        maximum = int(creator["max_per_run"])
+        shared_budget = {"limit": maximum, "remaining": maximum}
+        processed = set()
+        counts = {"downloaded": 0, "skipped": 0, "failed": 0}
+        category_errors = []
+        for category in categories:
+            try:
+                result = self._run_creator_category(account, creator, category,
+                                                    shared_budget, processed, log)
+                for key in counts:
+                    counts[key] += result[key]
+            except Exception as exc:
+                category_errors.append((category, exc))
+                counts["failed"] += 1
+                source = f"creator:{name}:{category}"
+                label = "帖子网格" if category == "posts" else "Reels"
+                self._log(log, "ERROR", source, f"{label}同步失败：{exc}")
+                if re.search(r"\b429\b|too many requests|rate.?limit", str(exc), re.I):
+                    self._log(log, "WARNING", source, "检测到限流，本轮不再请求另一种内容类型")
+                    break
+        if len(categories) > 1:
+            self.db.set_creator_sync_turn(account_id, name, categories[1])
+        creator["_sync_error"] = str(category_errors[0][1])[:1800] if category_errors else ""
         return counts
 
     def run(self, account, kind, log=None, username=None):
@@ -350,12 +400,17 @@ class SyncService:
             creator = self.db.creator(account["id"], username or "")
             if not creator or int(creator.get("manual", 0)) != 1:
                 raise ValueError("博主不存在或已移出监控列表")
-            source = f"creator:{creator['username']}:posts"
+            sources = [f"creator:{creator['username']}:{category}"
+                       for category in self.db._parse_sync_types(creator.get("sync_types", "posts"))]
+            source = sources[0]
             try:
                 counts = self._run_creator(account, creator, log)
                 if counts["failed"]:
-                    errors = self.db.source_errors(account["id"], source)
-                    error = errors[0] if errors else "有帖子下载失败，请展开运行日志查看详情"
+                    errors = [message for item_source in sources
+                              for message in self.db.source_errors(account["id"], item_source)]
+                    error = errors[0] if errors else (
+                        creator.get("_sync_error", "") or
+                        "有帖子或 Reels 下载失败，请展开运行日志查看详情")
                     rate_limited = bool(re.search(r"\b429\b|too many requests|rate.?limit", error, re.I))
             except Exception as exc:
                 counts["failed"] += 1

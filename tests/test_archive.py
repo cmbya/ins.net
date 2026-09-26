@@ -47,6 +47,7 @@ class FakeGallery:
         self.calls = 0
         self.partial = False
         self.posts_data = posts or [post("ABC123", media_count=2)]
+        self.posts_by_url = {}
         self.post_requests = []
         self.scan_requests = []
         self.history_responses = {}
@@ -54,14 +55,15 @@ class FakeGallery:
 
     def posts(self, cookie, url, max_posts):
         self.post_requests.append((url, max_posts))
-        items = list(self.posts_data)
+        items = list(self.posts_by_url.get(url, self.posts_data))
         return items if max_posts is None else items[:max_posts]
 
     def scan_posts(self, cookie, url, max_posts=None, cursor=None):
         self.scan_requests.append((url, max_posts, cursor))
         if max_posts == 20:
-            return list(self.posts_data[:20]), None
-        return self.history_responses.get(cursor, ([], None))
+            items = self.posts_by_url.get(url, self.posts_data)
+            return list(items[:20]), None
+        return self.history_responses.get((url, cursor), self.history_responses.get(cursor, ([], None)))
 
     def download(self, cookie, item, staging, media_ids=None):
         self.calls += 1
@@ -73,7 +75,8 @@ class FakeGallery:
                 continue
             if self.partial and media["position"] > 1:
                 continue
-            (path / f"{media['media_id']}.jpg").write_bytes(b"image:" + media["media_id"].encode())
+            (path / f"{media['media_id']}.{media.get('extension', 'jpg')}").write_bytes(
+                b"image:" + media["media_id"].encode())
         return {p.stem: p for p in path.iterdir()}
 
 
@@ -105,6 +108,10 @@ class ArchiveTests(unittest.TestCase):
         self.assertEqual(posts[0]["profile_id"], "1234")
         self.assertIn("/p/", posts[0]["source_url"])
 
+    def test_reels_metadata_without_post_url_uses_reel_permalink(self):
+        reels = normalize_messages(MESSAGES, "reels")
+        self.assertEqual(reels[0]["source_url"], "https://www.instagram.com/reel/ABC123/")
+
     def test_scan_posts_extracts_gallery_dl_cursor_and_profile(self):
         gallery = GalleryDL()
         stderr = "[instagram][debug] Cursor: QVFDLTIwMjY="
@@ -128,6 +135,12 @@ class ArchiveTests(unittest.TestCase):
             items = gallery.posts("cookies.txt", "https://www.instagram.com/owner/posts/")
         self.assertEqual(len(items), 1)
         self.assertEqual(items[0]["shortcode"], "ABC123")
+
+    def test_gallery_dl_reels_profile_url_preserves_reel_permalink(self):
+        gallery = GalleryDL()
+        with patch.object(gallery, "_run", return_value=(json.dumps(MESSAGES), "")):
+            items = gallery.posts("cookies.txt", "https://www.instagram.com/owner/reels/")
+        self.assertEqual(items[0]["source_url"], "https://www.instagram.com/reel/ABC123/")
 
     def test_partial_download_retries_then_skips_completed_creator_post(self):
         with tempfile.TemporaryDirectory() as temporary:
@@ -372,6 +385,96 @@ class ArchiveTests(unittest.TestCase):
             self.assertEqual(len(fake.scan_requests), 1)
             self.assertTrue(fake.scan_requests[0][0].endswith("/selected/posts/"))
             self.assertFalse(any("reels" in item[0] for item in fake.scan_requests))
+
+    def test_selected_posts_and_reels_share_limit_and_rotate_between_feeds(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            grid_url = "https://www.instagram.com/creator/posts/"
+            reels_url = "https://www.instagram.com/creator/reels/"
+            reel1 = post("REEL001", date="2026-09-02")
+            reel1["source_url"] = "https://www.instagram.com/reel/REEL001/"
+            reel1["items"][0].update(kind="video", extension="mp4")
+            reel2 = post("REEL002", date="2026-09-01")
+            reel2["source_url"] = "https://www.instagram.com/reel/REEL002/"
+            reel2["items"][0].update(kind="video", extension="mp4")
+            fake = FakeGallery([post("GRID001"), post("GRID002")])
+            fake.posts_by_url = {
+                grid_url: [post("GRID001"), post("GRID002")],
+                reels_url: [reel1, reel2],
+            }
+            db, account, fake, archive = self.setup_service(root, fake)
+            db.add_creator(account["id"], "creator", ["posts", "reels"])
+            db.save_admin_config({"creator_interval":360,"creator_max":1,"scheduler_enabled":1,"log_days":30})
+            service = SyncService(db, root, fake, archive_root=archive)
+
+            first, _ = service.run(account, "creator", username="creator")
+            creator = db.creator(account["id"], "creator")
+            self.assertEqual(first["downloaded"], 1)
+            self.assertEqual(creator["sync_turn"], "reels")
+            self.assertTrue(any(url == grid_url for url, _, _ in fake.scan_requests))
+            self.assertTrue(any(url == reels_url for url, _, _ in fake.scan_requests))
+
+            second, _ = service.run(account, "creator", username="creator")
+            self.assertEqual(second["downloaded"], 1)
+            self.assertLessEqual(first["downloaded"] + first["failed"] +
+                                 second["downloaded"] + second["failed"], 2)
+            saved = db.posts(account["id"])
+            self.assertEqual(sum(item["status"] == "complete" for item in saved), 2)
+            self.assertIn("creator:creator:reels",
+                          next(item for item in saved if item["shortcode"] == "REEL001")["sources"])
+            self.assertTrue(all((archive / media["relative_path"]).is_file()
+                                for item in saved for media in item["media"]
+                                if media["relative_path"]))
+
+    def test_same_shortcode_found_in_grid_and_reels_is_archived_once(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            grid_url = "https://www.instagram.com/creator/posts/"
+            reels_url = "https://www.instagram.com/creator/reels/"
+            same = post("SAME001")
+            same_reel = {**same, "source_url": "https://www.instagram.com/reel/SAME001/"}
+            fake = FakeGallery([same])
+            fake.posts_by_url = {grid_url: [same], reels_url: [same_reel]}
+            db, account, fake, archive = self.setup_service(root, fake)
+            db.add_creator(account["id"], "creator", ["posts", "reels"])
+            service = SyncService(db, root, fake, archive_root=archive)
+
+            counts, _ = service.run(account, "creator", username="creator")
+            record = db.posts(account["id"])[0]
+
+            self.assertEqual(counts["downloaded"], 1)
+            self.assertEqual(fake.calls, 1)
+            self.assertEqual(record["sources"], ["creator:creator:posts", "creator:creator:reels"])
+            self.assertEqual(db.dashboard(account["id"])["total"], 1)
+            self.assertEqual(db.records({"account": account["id"]})["total"], 1)
+
+    def test_all_history_keeps_independent_posts_and_reels_cursors(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            grid_url = "https://www.instagram.com/creator/posts/"
+            reels_url = "https://www.instagram.com/creator/reels/"
+            reel = post("REELHIST")
+            reel["source_url"] = "https://www.instagram.com/reel/REELHIST/"
+            fake = FakeGallery([post("GRIDHEAD")])
+            fake.posts_by_url = {grid_url: [post("GRIDHEAD")], reels_url: [reel]}
+            fake.history_responses[(grid_url, None)] = ([post("GRIDOLD")], "posts-next")
+            fake.history_responses[(reels_url, None)] = ([reel], "reels-next")
+            db, account, fake, archive = self.setup_service(root, fake)
+            db.add_creator(account["id"], "creator", ["posts", "reels"])
+            db.set_creator(account["id"], "creator", sync_mode="all")
+            db.save_admin_config({"creator_interval":360,"creator_max":1,"scheduler_enabled":1,"log_days":30})
+            service = SyncService(db, root, fake, archive_root=archive)
+
+            counts, _ = service.run(account, "creator", username="creator")
+
+            state = db.creator(account["id"], "creator")
+            self.assertEqual(counts["downloaded"], 1)
+            self.assertEqual(state["scan_cursor"], "posts-next")
+            self.assertEqual(state["reels_scan_cursor"], "reels-next")
+            self.assertEqual(state["history_complete"], 0)
+            self.assertEqual(state["reels_history_complete"], 0)
+            history_calls = [(url, cursor) for url, size, cursor in fake.scan_requests if size == 31]
+            self.assertEqual(history_calls, [(grid_url, None), (reels_url, None)])
 
     def test_archive_copies_across_mounts_before_atomic_replace(self):
         with tempfile.TemporaryDirectory() as temporary:
