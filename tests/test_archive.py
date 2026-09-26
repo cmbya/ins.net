@@ -438,8 +438,10 @@ class ArchiveTests(unittest.TestCase):
             db, account, fake, archive = self.setup_service(root, fake)
             db.add_creator(account["id"], "creator", ["posts", "reels"])
             service = SyncService(db, root, fake, archive_root=archive)
+            logs = []
 
-            counts, _ = service.run(account, "creator", username="creator")
+            counts, _ = service.run(account, "creator", log=lambda *entry: logs.append(entry),
+                                    username="creator")
             record = db.posts(account["id"])[0]
 
             self.assertEqual(counts["downloaded"], 1)
@@ -447,6 +449,14 @@ class ArchiveTests(unittest.TestCase):
             self.assertEqual(record["sources"], ["creator:creator:posts", "creator:creator:reels"])
             self.assertEqual(db.dashboard(account["id"])["total"], 1)
             self.assertEqual(db.records({"account": account["id"]})["total"], 1)
+            messages = [message for _, _, message in logs]
+            self.assertTrue(any("帖子网格本轮统计：下载 1 条作品" in message for message in messages))
+            self.assertTrue(any("Reels本轮统计：下载 0 条作品" in message and
+                                "跨类型短码去重 1 条" in message for message in messages))
+            self.assertTrue(any("跨类型去重 @creator/SAME001" in message and
+                                "Reels关联到同一作品记录和归档文件，不重复下载" in message
+                                for message in messages))
+            self.assertTrue(any("两类合计实际下载 1 条唯一作品" in message for message in messages))
 
     def test_all_history_keeps_independent_posts_and_reels_cursors(self):
         with tempfile.TemporaryDirectory() as temporary:
