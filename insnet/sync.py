@@ -2,10 +2,12 @@
 
 import logging
 import os
+import random
 import re
 import shutil
 import tempfile
 import threading
+import time
 import unicodedata
 from collections import Counter
 from pathlib import Path
@@ -207,6 +209,11 @@ class SyncService:
             return scanner(account["cookie_path"], url, max_posts=max_posts, cursor=cursor)
         return self.gallery.posts(account["cookie_path"], url, max_posts), None
 
+    @staticmethod
+    def _pause_history_scan():
+        """Space out paged profile requests to reduce request bursts."""
+        time.sleep(random.uniform(2, 9))
+
     def _persist_scan(self, account, posts, source, creator=None):
         for post in posts:
             post_id = self.db.upsert_post(account["id"], post, source)
@@ -311,12 +318,11 @@ class SyncService:
         url = f"https://www.instagram.com/{name}/{'posts' if category == 'posts' else 'reels'}/"
         mode = creator["sync_mode"]
         content_label = "帖子网格" if category == "posts" else "Reels"
-        history_cursor_key = "scan_cursor" if category == "posts" else "reels_scan_cursor"
-        history_complete_key = "history_complete" if category == "posts" else "reels_history_complete"
         verify_cursor_key = "verify_cursor" if category == "posts" else "reels_verify_cursor"
+        all_history = mode == "all"
         self._log(log, "INFO", source,
                   f"开始同步 @{name} 的{content_label}："
-                  f"{'最新 20 条' if mode == 'recent20' else '全部历史分批扫描'}，"
+                  f"{'最新 20 条' if not all_history else '全部历史逐页扫描（每轮从最新页重新检查）'}，"
                   f"本博主本轮下载上限 {shared_budget['limit']} 条（帖子网格与 Reels 合计）")
         # Snapshot the unfinished queue before the new metadata scan inserts its
         # discoveries. This lets the batch finish queued work before extending it.
@@ -325,47 +331,6 @@ class SyncService:
         self._log(log, "INFO", source,
                   f"本类别开始时已有待处理 {len(backlog)} 条：待下载 {backlog_statuses.get('pending', 0)} 条，"
                   f"失败待重试 {backlog_statuses.get('partial', 0)} 条")
-        recent, _ = self._scan(account, url, 20)
-        self._persist_scan(account, recent, source, name)
-        self._log(log, "INFO", source, f"最新内容读取完成：{len(recent)} 条{content_label}作品")
-
-        scanned = list(recent)
-        history_count = 0
-        next_cursor = creator.get(history_cursor_key)
-        history_complete = bool(creator.get(history_complete_key))
-        if mode == "all" and not history_complete:
-            previous_cursor = next_cursor
-            history, next_cursor = self._scan(account, url, 31, cursor=previous_cursor)
-            history_count = len(history)
-            self._persist_scan(account, history, source, name)
-            scanned.extend(history)
-            history_complete = next_cursor is None
-            if next_cursor == previous_cursor and previous_cursor is not None:
-                raise GalleryError("历史扫描游标没有前进，已暂停本轮，避免重复扫描")
-            self.db.update_creator_scan(account_id, name, next_cursor, history_complete, category)
-            state = "历史已经扫描完毕" if history_complete else "历史扫描进度已保存，下一轮从此处继续"
-            self._log(log, "INFO", source, f"本轮读取 {len(history)} 条历史{content_label}作品；{state}")
-
-        backlog_shortcodes = {post["shortcode"] for post in backlog}
-        scanned_shortcodes = {post["shortcode"] for post in scanned}
-        repeated_scan_rows = len(scanned) - len(scanned_shortcodes)
-        overlap_with_backlog = len(backlog_shortcodes & scanned_shortcodes)
-        self._log(log, "INFO", source,
-                  f"本轮扫描明细：最新内容 {len(recent)} 条，历史内容 {history_count} 条；"
-                  f"按作品短码合并后 {len(scanned_shortcodes)} 条，与开始前待处理队列重合 {overlap_with_backlog} 条，"
-                  f"扫描页内部重复 {repeated_scan_rows} 条；不在旧队列中的扫描作品 "
-                  f"{len(scanned_shortcodes - backlog_shortcodes)} 条")
-
-        # Current page and persisted backlog are merged by shortcode. Complete
-        # records are cheap skips; pending items precede partial failures so one
-        # repeatedly failing post cannot block an entire history archive.
-        # Keep discovered but unfinished posts queued even after newer posts push
-        # them out of the recent-20 feed.
-        by_shortcode = {post["shortcode"]: {**post, "queued_before_run": True} for post in backlog}
-        for post in scanned:
-            if post["shortcode"] not in by_shortcode:
-                by_shortcode[post["shortcode"]] = {**post, "queued_before_run": False}
-
         # Check a bounded page of complete records every run. This catches files
         # removed or truncated on disk, even when the post is outside recent20.
         verify_cursor = int(creator.get(verify_cursor_key) or 0)
@@ -374,32 +339,194 @@ class SyncService:
         if not archived and verify_cursor:
             verify_cursor = 0
             archived = self.db.creator_complete_posts(account_id, name, 0, limit=50,
-                                                      category=category)
+                                                  category=category)
         repaired_candidates = 0
+        repaired_posts = []
         for post in archived:
             if not self._locally_complete(post, source, log):
                 self.db.set_post_status(post["id"], "partial", "归档文件缺失或大小与记录不一致")
                 post["status"] = "partial"
                 post["scanned_this_run"] = False
                 post["queued_before_run"] = True
-                by_shortcode[post["shortcode"]] = post
+                repaired_posts.append(post)
                 repaired_candidates += 1
         next_verify_cursor = archived[-1]["id"] if len(archived) == 50 else 0
         self.db.update_creator_verify_cursor(account_id, name, next_verify_cursor, category)
         self._log(log, "INFO", source,
                   f"归档完整性抽查 {len(archived)} 条；发现需补齐 {repaired_candidates} 条")
 
-        candidates = list(by_shortcode.values())
-        # Process older queue entries first, preserving discovery order within
-        # each queue. New discoveries are appended after existing pending work;
-        # partial failures follow pending items so one failed post cannot starve.
-        candidates.sort(key=lambda p: (
-            0 if p.get("queued_before_run") and p.get("status") != "partial" else
-            1 if p.get("queued_before_run") else 2,
-            int(p.get("id") or 0),
-        ))
-        result = self._download_batch(account, source, candidates, log=log,
-                                      shared_budget=shared_budget, processed=processed)
+        # Merge retries and integrity repairs before newly discovered items.
+        backlog_by_shortcode = {
+            post["shortcode"]: {**post, "queued_before_run": True} for post in backlog
+        }
+        for post in repaired_posts:
+            backlog_by_shortcode[post["shortcode"]] = {**post, "queued_before_run": True}
+
+        result = {"downloaded": 0, "skipped": 0, "failed": 0,
+                  "cross_type_duplicates": 0, "deferred": 0}
+
+        def order_candidates(items):
+            return sorted(items, key=lambda post: (
+                0 if post.get("queued_before_run") and post.get("status") != "partial" else
+                1 if post.get("queued_before_run") else 2,
+                int(post.get("id") or 0),
+            ))
+
+        def process_batch(items):
+            if not items:
+                return
+            batch = self._download_batch(account, source, order_candidates(items), log=log,
+                                         shared_budget=shared_budget, processed=processed)
+            for key in result:
+                result[key] += batch.get(key, 0)
+
+        scan_error = ""
+        raw_scanned = 0
+        recent_count = 0
+        history_count = 0
+        repeated_scan_rows = 0
+        overlap_with_backlog = 0
+        scanned_shortcodes = set()
+
+        if not all_history:
+            # Keep recent-only mode bounded to the requested 20 posts.
+            recent, _ = self._scan(account, url, 20)
+            self._persist_scan(account, recent, source, name)
+            recent_count = len(recent)
+            raw_scanned = len(recent)
+            self._log(log, "INFO", source,
+                      f"最新内容读取完成：{len(recent)} 条{content_label}作品")
+            candidates = dict(backlog_by_shortcode)
+            seen = set()
+            for post in recent:
+                shortcode = post["shortcode"]
+                if shortcode in seen:
+                    repeated_scan_rows += 1
+                    continue
+                seen.add(shortcode)
+                scanned_shortcodes.add(shortcode)
+                if shortcode in backlog_by_shortcode:
+                    overlap_with_backlog += 1
+                    continue
+                candidates[shortcode] = {**post, "queued_before_run": False}
+            process_batch(list(candidates.values()))
+        else:
+            # Never trust a persisted "history complete" flag as a permanent
+            # stop condition. Each all-history run restarts at the newest page,
+            # follows the returned cursor, and uses shortcode/file checks to
+            # skip archives already present on disk.
+            self.db.update_creator_scan(account_id, name, None, False, category)
+            self._log(log, "INFO", source,
+                      "全历史扫描从最新页开始；逐页跟随 Instagram 游标，已归档作品按短码和本地文件跳过；"
+                      "达到本轮下载上限后，下轮仍从最新页重新扫描")
+            cursor = None
+            requested_cursors = set()
+            seen_in_walk = set()
+            page_number = 0
+            backlog_processed = False
+            page_limit = 31
+            if shared_budget["remaining"] <= 0:
+                self._log(log, "INFO", source,
+                          "本博主共享下载额度已由另一种内容类型用完；本轮不再请求此类别，"
+                          "待后续任务从最新页继续检查")
+
+            while shared_budget["remaining"] > 0:
+                if cursor in requested_cursors:
+                    scan_error = "Instagram 历史游标重复，已停止翻页，避免无限重复扫描"
+                    break
+                requested_cursors.add(cursor)
+                try:
+                    page, next_cursor = self._scan(account, url, page_limit, cursor=cursor)
+                except Exception as exc:
+                    scan_error = str(exc)
+                    break
+
+                page_number += 1
+                self._persist_scan(account, page, source, name)
+                raw_scanned += len(page)
+                if page_number == 1:
+                    recent_count = len(page)
+                else:
+                    history_count += len(page)
+
+                page_candidates = []
+                if page_number == 1:
+                    page_candidates.extend(backlog_by_shortcode.values())
+                    backlog_processed = True
+                new_on_page = 0
+                for post in page:
+                    shortcode = post["shortcode"]
+                    if shortcode in seen_in_walk:
+                        repeated_scan_rows += 1
+                        continue
+                    seen_in_walk.add(shortcode)
+                    scanned_shortcodes.add(shortcode)
+                    if shortcode in backlog_by_shortcode:
+                        overlap_with_backlog += 1
+                        continue
+                    page_candidates.append({**post, "queued_before_run": False})
+                    new_on_page += 1
+
+                before_remaining = shared_budget["remaining"]
+                before_downloaded = result["downloaded"]
+                before_skipped = result["skipped"]
+                before_failed = result["failed"]
+                process_batch(page_candidates)
+                self._log(log, "INFO", source,
+                          f"分页第 {page_number} 页读取 {len(page)} 条{content_label}作品，"
+                          f"去重后新增候选 {new_on_page} 条；本页下载 "
+                          f"{result['downloaded'] - before_downloaded}、跳过 "
+                          f"{result['skipped'] - before_skipped}、失败 "
+                          f"{result['failed'] - before_failed}；下载额度 "
+                          f"{before_remaining}→{shared_budget['remaining']}；"
+                          f"{'有下一页游标' if next_cursor else '未返回下一页游标'}")
+
+                if not page:
+                    self._log(log, "INFO", source,
+                              f"第 {page_number} 页没有返回作品；本轮翻页结束，下轮仍从最新页复核")
+                    break
+                if next_cursor is None:
+                    if len(page) >= page_limit:
+                        scan_error = (f"第 {page_number} 页返回了 {len(page)} 条，但 Gallery-dl 没有提供下一页游标；"
+                                      "无法确认历史已到末尾，本轮暂停翻页，下轮会从最新页重试")
+                    else:
+                        self._log(log, "INFO", source,
+                                  f"第 {page_number} 页未返回下一页游标且少于 {page_limit} 条；"
+                                  "本轮到达当前可读取末页，下轮仍会从最新页重新检查")
+                    break
+                if next_cursor == cursor or next_cursor in requested_cursors:
+                    scan_error = "Instagram 历史游标没有前进，已停止翻页，避免无限重复扫描"
+                    break
+                if shared_budget["remaining"] <= 0:
+                    self._log(log, "INFO", source,
+                              f"达到本博主本轮下载上限；已保存第 {page_number} 页发现的作品，"
+                              "本轮不再请求更旧页面，下轮从最新页重新扫描并跳过已归档作品")
+                    break
+                cursor = next_cursor
+                self._pause_history_scan()
+
+            if not backlog_processed:
+                process_batch(list(backlog_by_shortcode.values()))
+            if scan_error:
+                self._log(log, "ERROR", source, f"全历史分页未能确认完成：{scan_error}")
+                result["failed"] += 1
+                result["error"] = scan_error
+
+            unique_scanned = len(scanned_shortcodes)
+            self._log(log, "INFO", source,
+                      f"本轮全历史扫描明细：读取 {page_number} 页，最新页 {recent_count} 条、"
+                      f"后续历史页 {history_count} 条；原始返回 {raw_scanned} 条，"
+                      f"按作品短码去重后 {unique_scanned} 条；与开始前待处理队列重合 "
+                      f"{overlap_with_backlog} 条，分页重复 {repeated_scan_rows} 条")
+
+        if not all_history:
+            unique_scanned = len(scanned_shortcodes)
+            self._log(log, "INFO", source,
+                      f"本轮扫描明细：最新内容 {recent_count} 条，历史内容 0 条；"
+                      f"按作品短码合并后 {unique_scanned} 条，与开始前待处理队列重合 {overlap_with_backlog} 条，"
+                      f"扫描页内部重复 {repeated_scan_rows} 条；不在旧队列中的扫描作品 "
+                      f"{len(scanned_shortcodes - set(backlog_by_shortcode))} 条")
+
         pending_after = self.db.creator_pending_posts(account_id, name, category)
         pending_statuses = Counter(post.get("status", "unknown") for post in pending_after)
         result["pending_after"] = len(pending_after)
@@ -433,6 +560,12 @@ class SyncService:
                 category_results[category] = result
                 for key in counts:
                     counts[key] += result[key]
+                if result.get("error"):
+                    category_errors.append((category, GalleryError(result["error"])))
+                    if re.search(r"\b429\b|too many requests|rate.?limit", result["error"], re.I):
+                        self._log(log, "WARNING", f"creator:{name}:{category}",
+                                  "检测到限流，本轮不再请求另一种内容类型")
+                        break
             except Exception as exc:
                 category_errors.append((category, exc))
                 counts["failed"] += 1
