@@ -7,6 +7,7 @@ import shutil
 import tempfile
 import threading
 import unicodedata
+from collections import Counter
 from pathlib import Path
 from tempfile import TemporaryDirectory
 
@@ -237,26 +238,41 @@ class SyncService:
         duplicates = 0
         scanned_skips = 0
         cleared_file_skips = 0
+        category = source.rsplit(":", 1)[-1]
+        content_label = "帖子网格" if category == "posts" else "Reels" if category == "reels" else category
         for post in posts:
             shortcode = post["shortcode"]
             if processed is not None and shortcode in processed:
                 duplicates += 1
+                prior = processed[shortcode]
+                prior_category = prior.get("category", "") if isinstance(prior, dict) else ""
+                prior_outcome = prior.get("outcome", "已处理") if isinstance(prior, dict) else "已处理"
+                prior_label = "帖子网格" if prior_category == "posts" else "Reels" if prior_category == "reels" else prior_category
+                self._log(log, "INFO", source,
+                          f"跨类型去重 @{post['username']}/{shortcode}：同一作品已由{prior_label}处理（{prior_outcome}）；"
+                          f"{content_label}关联到同一作品记录和归档文件，不重复下载")
                 continue
             if processed is not None:
-                processed.add(shortcode)
+                processed[shortcode] = {"category": category, "outcome": "正在检查"}
             stored = self.db.post(post['id'])
             was_cleared = bool(stored and stored.get("deleted_at"))
             if not was_cleared and post.get("status") == "complete" and not post.get("scanned_this_run"):
                 counts["skipped"] += 1
+                if processed is not None:
+                    processed[shortcode]["outcome"] = "记录已完整归档，跳过"
                 continue
             if self._locally_complete(post, source, log, allow_legacy_restore=not was_cleared):
                 self.db.set_post_status(post["id"], "complete")
                 counts["skipped"] += 1
                 scanned_skips += bool(post.get("scanned_this_run"))
                 cleared_file_skips += bool(was_cleared)
+                if processed is not None:
+                    processed[shortcode]["outcome"] = "本地媒体完整，跳过"
                 continue
             if (shared_budget is not None and shared_budget["remaining"] <= 0) or (
                     max_per_run is not None and attempts >= max_per_run):
+                if processed is not None:
+                    processed[shortcode]["outcome"] = "共享下载上限已满，留待后续"
                 continue
             if was_cleared:
                 # A cleared record is only hidden while its files remain intact.
@@ -269,6 +285,12 @@ class SyncService:
                 shared_budget["remaining"] -= 1
             result = self._archive(account, post, source, log, allow_legacy_restore=not was_cleared)
             counts[result] += 1
+            if processed is not None:
+                processed[shortcode]["outcome"] = {
+                    "downloaded": "本轮已下载归档",
+                    "skipped": "本地媒体完整，跳过",
+                    "failed": "本轮下载失败",
+                }[result]
         if counts["skipped"]:
             self._log(log, "INFO", source,
                       f"跳过 {counts['skipped']} 条：本轮扫描且归档文件完整 {scanned_skips} 条，"
@@ -277,7 +299,10 @@ class SyncService:
         queued = max(0, len(posts) - duplicates - attempts - counts["skipped"])
         if queued:
             self._log(log, "INFO", source,
-                      f"达到本轮下载上限；还有 {queued} 条待下载，将在后续同步继续")
+                      f"达到本博主帖子网格与 Reels 共用的本轮下载上限；{content_label}还有 {queued} 条候选本轮未尝试，"
+                      "保留在待处理队列中，将在后续同步继续")
+        counts["cross_type_duplicates"] = duplicates
+        counts["deferred"] = queued
         return counts
 
     def _run_creator_category(self, account, creator, category, shared_budget, processed, log=None):
@@ -296,16 +321,22 @@ class SyncService:
         # Snapshot the unfinished queue before the new metadata scan inserts its
         # discoveries. This lets the batch finish queued work before extending it.
         backlog = self.db.creator_pending_posts(account_id, name, category)
+        backlog_statuses = Counter(post.get("status", "unknown") for post in backlog)
+        self._log(log, "INFO", source,
+                  f"本类别开始时已有待处理 {len(backlog)} 条：待下载 {backlog_statuses.get('pending', 0)} 条，"
+                  f"失败待重试 {backlog_statuses.get('partial', 0)} 条")
         recent, _ = self._scan(account, url, 20)
         self._persist_scan(account, recent, source, name)
         self._log(log, "INFO", source, f"最新内容读取完成：{len(recent)} 条{content_label}作品")
 
         scanned = list(recent)
+        history_count = 0
         next_cursor = creator.get(history_cursor_key)
         history_complete = bool(creator.get(history_complete_key))
         if mode == "all" and not history_complete:
             previous_cursor = next_cursor
             history, next_cursor = self._scan(account, url, 31, cursor=previous_cursor)
+            history_count = len(history)
             self._persist_scan(account, history, source, name)
             scanned.extend(history)
             history_complete = next_cursor is None
@@ -314,6 +345,16 @@ class SyncService:
             self.db.update_creator_scan(account_id, name, next_cursor, history_complete, category)
             state = "历史已经扫描完毕" if history_complete else "历史扫描进度已保存，下一轮从此处继续"
             self._log(log, "INFO", source, f"本轮读取 {len(history)} 条历史{content_label}作品；{state}")
+
+        backlog_shortcodes = {post["shortcode"] for post in backlog}
+        scanned_shortcodes = {post["shortcode"] for post in scanned}
+        repeated_scan_rows = len(scanned) - len(scanned_shortcodes)
+        overlap_with_backlog = len(backlog_shortcodes & scanned_shortcodes)
+        self._log(log, "INFO", source,
+                  f"本轮扫描明细：最新内容 {len(recent)} 条，历史内容 {history_count} 条；"
+                  f"按作品短码合并后 {len(scanned_shortcodes)} 条，与开始前待处理队列重合 {overlap_with_backlog} 条，"
+                  f"扫描页内部重复 {repeated_scan_rows} 条；不在旧队列中的扫描作品 "
+                  f"{len(scanned_shortcodes - backlog_shortcodes)} 条")
 
         # Current page and persisted backlog are merged by shortcode. Complete
         # records are cheap skips; pending items precede partial failures so one
@@ -357,8 +398,20 @@ class SyncService:
             1 if p.get("queued_before_run") else 2,
             int(p.get("id") or 0),
         ))
-        return self._download_batch(account, source, candidates, log=log,
-                                    shared_budget=shared_budget, processed=processed)
+        result = self._download_batch(account, source, candidates, log=log,
+                                      shared_budget=shared_budget, processed=processed)
+        pending_after = self.db.creator_pending_posts(account_id, name, category)
+        pending_statuses = Counter(post.get("status", "unknown") for post in pending_after)
+        result["pending_after"] = len(pending_after)
+        result["pending_statuses"] = dict(pending_statuses)
+        self._log(log, "INFO", source,
+                  f"{content_label}本轮统计：下载 {result['downloaded']} 条作品，已归档跳过 {result['skipped']} 条，"
+                  f"失败 {result['failed']} 条，跨类型短码去重 {result['cross_type_duplicates']} 条，"
+                  f"因共享上限留待后续 {result['deferred']} 条；本类别结束后待处理队列 "
+                  f"{len(pending_after)} 条（待下载 {pending_statuses.get('pending', 0)} 条，"
+                  f"失败待重试 {pending_statuses.get('partial', 0)} 条）；"
+                  f"本博主共享下载额度剩余 {shared_budget['remaining']}/{shared_budget['limit']} 条")
+        return result
 
     def _run_creator(self, account, creator, log=None):
         account_id, name = account["id"], creator["username"]
@@ -369,24 +422,46 @@ class SyncService:
             categories = categories[start_at:] + categories[:start_at]
         maximum = int(creator["max_per_run"])
         shared_budget = {"limit": maximum, "remaining": maximum}
-        processed = set()
+        processed = {}
         counts = {"downloaded": 0, "skipped": 0, "failed": 0}
         category_errors = []
+        category_results = {}
         for category in categories:
             try:
                 result = self._run_creator_category(account, creator, category,
                                                     shared_budget, processed, log)
+                category_results[category] = result
                 for key in counts:
                     counts[key] += result[key]
             except Exception as exc:
                 category_errors.append((category, exc))
                 counts["failed"] += 1
+                category_results[category] = {
+                    "downloaded": 0, "skipped": 0, "failed": 1,
+                    "cross_type_duplicates": 0, "deferred": 0,
+                    "pending_after": 0, "pending_statuses": {},
+                }
                 source = f"creator:{name}:{category}"
                 label = "帖子网格" if category == "posts" else "Reels"
                 self._log(log, "ERROR", source, f"{label}同步失败：{exc}")
                 if re.search(r"\b429\b|too many requests|rate.?limit", str(exc), re.I):
                     self._log(log, "WARNING", source, "检测到限流，本轮不再请求另一种内容类型")
                     break
+        category_summaries = []
+        for category in ("posts", "reels"):
+            label = "帖子网格" if category == "posts" else "Reels"
+            if category not in categories:
+                category_summaries.append(f"{label}未启用")
+                continue
+            result = category_results.get(category, {})
+            category_summaries.append(
+                f"{label}下载 {result.get('downloaded', 0)} 条、跳过 {result.get('skipped', 0)} 条、"
+                f"失败 {result.get('failed', 0)} 条、跨类型去重 {result.get('cross_type_duplicates', 0)} 条、"
+                f"待处理 {result.get('pending_after', 0)} 条")
+        self._log(log, "INFO", f"creator:{name}",
+                  "本博主本轮分类汇总：" + "；".join(category_summaries) +
+                  f"；两类合计实际下载 {counts['downloaded']} 条唯一作品，"
+                  f"共享下载上限 {shared_budget['limit']} 条，剩余 {shared_budget['remaining']} 条")
         if len(categories) > 1:
             self.db.set_creator_sync_turn(account_id, name, categories[1])
         creator["_sync_error"] = str(category_errors[0][1])[:1800] if category_errors else ""
