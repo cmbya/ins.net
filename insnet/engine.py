@@ -159,28 +159,29 @@ class GalleryDL:
         staging.mkdir(parents=True, exist_ok=True)
         if not cookie_path:
             selected = set(media_ids or (item["media_id"] for item in post["items"]))
+            dash_ids = [item["media_id"] for item in post["items"]
+                        if item["media_id"] in selected and item.get("url", "").startswith("ytdl:")]
+            if dash_ids:
+                # gallery-dl supplies DASH audio/video metadata to its yt-dlp
+                # downloader. A bare ytdl: URL does not carry that metadata.
+                args = ["--no-mtime", "-D", str(staging), "-f", "{media_id}.{extension}",
+                        "--filter", f"media_id in {tuple(dash_ids)!r}", post["source_url"]]
+                self._run(None, args)
             for item in post["items"]:
                 if item["media_id"] not in selected:
                     continue
                 media_url = item.get("url", "")
                 if not media_url:
                     raise GalleryError("匿名模式缺少本轮扫描的媒体地址；需重新扫描该作品或改用账号 Cookie")
+                if media_url.startswith("ytdl:"):
+                    continue
                 target = staging / f"{item['media_id']}.{item['extension']}"
-                direct_url = media_url.removeprefix("ytdl:")
-                self._validate_media_url(direct_url)
+                self._validate_media_url(media_url)
                 try:
-                    if media_url.startswith("ytdl:"):
-                        command = ["yt-dlp", "--ignore-config", "--no-playlist", "--no-part",
-                                   "--no-progress", "-o", str(target), direct_url]
-                        result = subprocess.run(command, capture_output=True, text=True,
-                                                timeout=self.timeout, check=False)
-                        if result.returncode:
-                            raise GalleryError(f"匿名视频下载失败（yt-dlp 退出码 {result.returncode}）")
-                    else:
-                        opener = build_opener(self._SafeMediaRedirect())
-                        with opener.open(Request(direct_url, headers={"User-Agent": "Mozilla/5.0"}),
-                                         timeout=120) as response, target.open("wb") as output:
-                            shutil.copyfileobj(response, output)
+                    opener = build_opener(self._SafeMediaRedirect())
+                    with opener.open(Request(media_url, headers={"User-Agent": "Mozilla/5.0"}),
+                                     timeout=120) as response, target.open("wb") as output:
+                        shutil.copyfileobj(response, output)
                 except HTTPError as exc:
                     raise GalleryError(f"匿名媒体下载失败：HTTP {exc.code}") from exc
                 except (OSError, TimeoutError) as exc:
