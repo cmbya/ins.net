@@ -157,8 +157,22 @@ class SyncService:
                   f"下载 @{post['username']}/{post['shortcode']}：缺少 {len(missing)} 个媒体项")
         try:
             with TemporaryDirectory(dir=self.root / "tmp") as temporary:
-                files = self.gallery.download(account["cookie_path"], post, temporary,
-                                              media_ids=[row["media_id"] for row in missing])
+                media_ids = [row["media_id"] for row in missing]
+                cookie_path = account.get("download_cookie_path")
+                try:
+                    files = self.gallery.download(None, post, temporary, media_ids=media_ids)
+                    if not set(media_ids).issubset(files):
+                        raise GalleryError("公开方式未取得全部需要的媒体文件")
+                    self._log(log, "INFO", source,
+                              f"@{post['username']}/{post['shortcode']}：公开方式下载成功")
+                except GalleryError as public_error:
+                    if not cookie_path or re.search(r"\b429\b|too many requests|rate.?limit",
+                                                     str(public_error), re.I):
+                        raise
+                    self._log(log, "WARNING", source,
+                              f"@{post['username']}/{post['shortcode']}：公开方式下载失败"
+                              f"（{public_error}），尝试账号 Cookie")
+                    files = self.gallery.download(cookie_path, post, temporary, media_ids=media_ids)
                 for row in missing:
                     candidate = files.get(row["media_id"])
                     if not candidate:
@@ -276,7 +290,8 @@ class SyncService:
                 if processed is not None:
                     processed[shortcode]["outcome"] = "本地媒体完整，跳过"
                 continue
-            if not account["cookie_path"] and not all(item.get("url") for item in post.get("items", [])):
+            if not account["cookie_path"] and not account.get("download_cookie_path") and not all(
+                    item.get("url") for item in post.get("items", [])):
                 if processed is not None:
                     processed.pop(shortcode, None)
                 self._log(log, "INFO", source,
@@ -304,6 +319,13 @@ class SyncService:
                     "skipped": "本地媒体完整，跳过",
                     "failed": "本轮下载失败",
                 }[result]
+            if result == "failed":
+                error = (self.db.post(post["id"]) or {}).get("error") or ""
+                if re.search(r"\b429\b|too many requests|rate.?limit", error, re.I):
+                    counts["rate_limited"] = True
+                    self._log(log, "WARNING", source,
+                              "检测到 HTTP 429，本轮停止继续下载和翻页，等待调度退避")
+                    break
         if counts["skipped"]:
             self._log(log, "INFO", source,
                       f"跳过 {counts['skipped']} 条：本轮扫描且归档文件完整 {scanned_skips} 条，"
@@ -383,8 +405,10 @@ class SyncService:
                 return
             batch = self._download_batch(account, source, order_candidates(items), log=log,
                                          shared_budget=shared_budget, processed=processed)
-            for key in result:
+            for key in ("downloaded", "skipped", "failed", "cross_type_duplicates", "deferred"):
                 result[key] += batch.get(key, 0)
+            if batch.get("rate_limited"):
+                result["error"] = "HTTP 429（本轮下载遇到限流）"
 
         scan_error = ""
         raw_scanned = 0
@@ -402,7 +426,8 @@ class SyncService:
             raw_scanned = len(recent)
             self._log(log, "INFO", source,
                       f"最新内容读取完成：{len(recent)} 条{content_label}作品")
-            candidates = dict(backlog_by_shortcode) if account["cookie_path"] else {}
+            candidates = dict(backlog_by_shortcode) if (
+                account["cookie_path"] or account.get("download_cookie_path")) else {}
             seen = set()
             for post in recent:
                 shortcode = post["shortcode"]
@@ -413,8 +438,7 @@ class SyncService:
                 scanned_shortcodes.add(shortcode)
                 if shortcode in backlog_by_shortcode:
                     overlap_with_backlog += 1
-                    if not account["cookie_path"]:
-                        candidates[shortcode] = {**post, "queued_before_run": True}
+                    candidates[shortcode] = {**post, "queued_before_run": True}
                     continue
                 candidates[shortcode] = {**post, "queued_before_run": False}
             process_batch(list(candidates.values()))
@@ -457,9 +481,9 @@ class SyncService:
                 else:
                     history_count += len(page)
 
-                page_candidates = []
-                if page_number == 1 and account["cookie_path"]:
-                    page_candidates.extend(backlog_by_shortcode.values())
+                page_candidates = {}
+                if page_number == 1 and (account["cookie_path"] or account.get("download_cookie_path")):
+                    page_candidates.update(backlog_by_shortcode)
                     backlog_processed = True
                 new_on_page = 0
                 for post in page:
@@ -471,17 +495,18 @@ class SyncService:
                     scanned_shortcodes.add(shortcode)
                     if shortcode in backlog_by_shortcode:
                         overlap_with_backlog += 1
-                        if not account["cookie_path"]:
-                            page_candidates.append({**post, "queued_before_run": True})
+                        page_candidates[shortcode] = {**post, "queued_before_run": True}
                         continue
-                    page_candidates.append({**post, "queued_before_run": False})
+                    page_candidates[shortcode] = {**post, "queued_before_run": False}
                     new_on_page += 1
 
                 before_remaining = shared_budget["remaining"]
                 before_downloaded = result["downloaded"]
                 before_skipped = result["skipped"]
                 before_failed = result["failed"]
-                process_batch(page_candidates)
+                process_batch(list(page_candidates.values()))
+                if result.get("error"):
+                    break
                 self._log(log, "INFO", source,
                           f"分页第 {page_number} 页读取 {len(page)} 条{content_label}作品，"
                           f"去重后新增候选 {new_on_page} 条；本页下载 "
@@ -502,7 +527,8 @@ class SyncService:
                     else:
                         self._log(log, "INFO", source,
                                   f"第 {page_number} 页未返回下一页游标且少于 {page_limit} 条；"
-                                  "本轮到达当前可读取末页，下轮仍会从最新页重新检查")
+                                  "本轮到达当前接口可读取末页；无法仅据此证明与 Instagram 主页展示总数完全一致，"
+                                  "下轮仍会从最新页重新检查")
                     break
                 if next_cursor == cursor or next_cursor in requested_cursors:
                     scan_error = "Instagram 历史游标没有前进，已停止翻页，避免无限重复扫描"
@@ -515,9 +541,9 @@ class SyncService:
                 cursor = next_cursor
                 self._pause_history_scan()
 
-            if not backlog_processed and account["cookie_path"]:
+            if not backlog_processed and (account["cookie_path"] or account.get("download_cookie_path")):
                 process_batch(list(backlog_by_shortcode.values()))
-            if not account["cookie_path"]:
+            if not account["cookie_path"] and not account.get("download_cookie_path"):
                 unscanned = len(set(backlog_by_shortcode) - scanned_shortcodes)
                 if unscanned:
                     self._log(log, "INFO", source,
@@ -628,9 +654,17 @@ class SyncService:
             source = sources[0]
             try:
                 access_mode = creator.get("access_mode", "cookie")
+                cookie_allowed = bool(account.get("enabled", 1) and account.get("cookie_path"))
+                scan_cookie = account["cookie_path"] if access_mode == "cookie" and cookie_allowed else None
+                selected_account = {**account, "cookie_path": scan_cookie,
+                                    "download_cookie_path": account["cookie_path"] if cookie_allowed else None}
                 self._log(log, "INFO", source,
-                          f"访问方式：{'公开访问（不使用 Cookie）' if access_mode == 'anonymous' else '账号 Cookie'}")
-                selected_account = {**account, "cookie_path": None} if access_mode == "anonymous" else account
+                          f"扫描方式：{'账号 Cookie' if scan_cookie else '公开访问（无 Cookie）'}；"
+                          f"媒体下载：公开方式优先{'，失败后可用 Cookie 再试' if cookie_allowed else '，Cookie 不可用'}")
+                if access_mode == "cookie" and not scan_cookie:
+                    self._log(log, "WARNING", source,
+                              "博主配置使用 Cookie 扫描，但授权未启用或未上传 Cookie；本轮改用公开扫描，"
+                              "结果可能不完整")
                 counts = self._run_creator(selected_account, creator, log)
                 if counts["failed"]:
                     errors = [message for item_source in sources
@@ -638,7 +672,8 @@ class SyncService:
                     error = errors[0] if errors else (
                         creator.get("_sync_error", "") or
                         "有帖子或 Reels 下载失败，请展开运行日志查看详情")
-                    rate_limited = bool(re.search(r"\b429\b|too many requests|rate.?limit", error, re.I))
+                    rate_limited = bool(re.search(r"\b429\b|too many requests|rate.?limit",
+                                                  error + " " + creator.get("_sync_error", ""), re.I))
             except Exception as exc:
                 counts["failed"] += 1
                 error = str(exc)[:1800]
@@ -667,16 +702,15 @@ class Coordinator:
         account = self.db.account(account_id)
         if not account:
             raise ValueError("账号不存在")
-        if kind != "check" and not account.get("enabled", 1):
-            raise ValueError("账号同步已暂停，请先启用")
-        if kind == "check" and not account.get("cookie_path"):
-            raise ValueError("尚未配置 Cookie，无法进行授权检测")
+        if kind == "check":
+            if not account.get("enabled", 1):
+                raise ValueError("当前禁止使用 Cookie，请先启用后再检测")
+            if not account.get("cookie_path"):
+                raise ValueError("尚未配置 Cookie，无法进行授权检测")
         if kind == "creator":
             creator = self.db.creator(account_id, username or "")
             if not creator or int(creator.get("manual", 0)) != 1:
                 raise ValueError("博主不存在或已移出监控列表")
-            if creator.get("access_mode", "cookie") == "cookie" and not account.get("cookie_path"):
-                raise ValueError("该博主使用账号 Cookie，请先更新授权或切换为公开访问")
         with self.lock:
             if account_id in self.active:
                 raise ValueError("该账号有任务正在运行")
@@ -744,8 +778,6 @@ class Coordinator:
                     if self.db.setting('scheduler_enabled','1') == '1':
                         for account in self.db.accounts():
                             account_id = account["id"]
-                            if not account.get('enabled',1):
-                                continue
                             with self.lock:
                                 if account_id in self.active:
                                     continue
