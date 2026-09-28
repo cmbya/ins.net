@@ -23,7 +23,7 @@ from .sync import Coordinator, SyncService
 
 
 STATIC = Path(__file__).resolve().parent.parent / "static"
-APP_VERSION = "0.7.6"
+APP_VERSION = "0.7.7"
 
 
 def valid_cookie_file(value):
@@ -268,10 +268,20 @@ class Handler(BaseHTTPRequestHandler):
             if path == "/api/accounts":
                 name = str(value.get("username", "")).strip().lower().lstrip("@")
                 cookie = value.get("cookies")
-                if not USERNAME.fullmatch(name) or not valid_cookie_file(cookie):
-                    raise ValueError("用户名或 Netscape Cookie 文件无效（需含 instagram.com 的 sessionid 和 csrftoken）")
+                if not USERNAME.fullmatch(name):
+                    raise ValueError("Instagram 用户名无效")
+                if cookie and not valid_cookie_file(cookie):
+                    raise ValueError("Netscape Cookie 文件无效（需含 instagram.com 的 sessionid 和 csrftoken）")
                 existing = self.server.db.account_by_username(name)
-                account_id = existing["id"] if existing else self.server.db.add_account(name, "pending")
+                account_id = existing["id"] if existing else self.server.db.add_account(name, "")
+                label = str(value.get("label", "")).strip()[:60]
+                if not cookie:
+                    if existing:
+                        raise ValueError("更新授权时请上传 Cookie 文件")
+                    with self.server.db.connect() as conn:
+                        conn.execute("UPDATE accounts SET label=?,cookie_status='none' WHERE id=?",
+                                     (label, account_id))
+                    return self.reply(201, {"id": account_id})
                 target = self.server.db.root / "accounts" / account_id / "cookies.txt"
                 target.parent.mkdir(parents=True, exist_ok=True)
                 temporary = target.with_suffix(".tmp")
@@ -279,7 +289,6 @@ class Handler(BaseHTTPRequestHandler):
                 with os.fdopen(descriptor, "w", encoding="utf-8") as stream:
                     stream.write(cookie)
                 os.replace(temporary, target)
-                label = str(value.get("label", "")).strip()[:60]
                 with self.server.db.connect() as conn:
                     conn.execute("UPDATE accounts SET label=?,cookie_path=?,cookie_status='unverified',enabled=1 WHERE id=?",
                                  (label, str(target), account_id))
@@ -291,11 +300,14 @@ class Handler(BaseHTTPRequestHandler):
                 if not USERNAME.fullmatch(name):
                     raise ValueError("博主用户名无效")
                 sync_types = value.get("sync_types", ["posts"])
+                access_mode = value.get("access_mode", "anonymous")
+                if access_mode not in ("anonymous", "cookie"):
+                    raise ValueError("访问方式无效")
                 if (not isinstance(sync_types, list) or not sync_types
                         or any(item not in ("posts", "reels") for item in sync_types)
                         or len(set(sync_types)) != len(sync_types)):
                     raise ValueError("请选择帖子网格、Reels，或同时选择两者")
-                self.server.db.add_creator(account_id, name, sync_types)
+                self.server.db.add_creator(account_id, name, sync_types, access_mode)
                 return self.reply(201, {"ok": True})
             if path == "/api/creator":
                 name = str(value.get("username", ""))
@@ -304,6 +316,9 @@ class Handler(BaseHTTPRequestHandler):
                 enabled = value.get("enabled")
                 sync_mode = value.get("sync_mode")
                 sync_types = value.get("sync_types")
+                access_mode = value.get("access_mode")
+                if access_mode is not None and access_mode not in ("anonymous", "cookie"):
+                    raise ValueError("访问方式无效")
                 if enabled is not None and not isinstance(enabled, bool):
                     raise ValueError("自动同步开关无效")
                 if sync_mode is not None and sync_mode not in ("recent20", "all"):
@@ -314,7 +329,8 @@ class Handler(BaseHTTPRequestHandler):
                          or len(set(sync_types)) != len(sync_types))):
                     raise ValueError("请选择帖子网格、Reels，或同时选择两者")
                 if not self.server.db.set_creator(account_id, name, enabled=enabled,
-                                                 sync_mode=sync_mode, sync_types=sync_types):
+                                                 sync_mode=sync_mode, sync_types=sync_types,
+                                                 access_mode=access_mode):
                     raise ValueError("博主不存在")
                 return self.reply(200, {"ok": True})
             if path == "/api/creator/delete":
