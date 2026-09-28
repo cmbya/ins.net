@@ -125,8 +125,12 @@ class WebApiTests(unittest.TestCase):
                 time.sleep(.05)
         self.request_json("/api/creator", {
             "account": account["id"], "username": "publiccreator", "access_mode": "cookie"})
-        with self.assertRaisesRegex(ValueError, "Cookie"):
-            self.coordinator.start(account["id"], "creator", "publiccreator")
+        with patch.object(self.coordinator.service.gallery, "scan_posts", return_value=([], None)):
+            self.assertTrue(self.coordinator.start(account["id"], "creator", "publiccreator"))
+            for _ in range(40):
+                if account["id"] not in self.coordinator.active:
+                    break
+                time.sleep(.05)
 
 
     def test_dashboard_records_soft_delete_preserve_files_and_logs(self):
@@ -249,6 +253,7 @@ class WebApiTests(unittest.TestCase):
         self.assertEqual(self.db.setting("media_subdir"),before)
         _, accounts = self.request_json("/api/admin/accounts")
         self.assertNotIn("cookie_path",accounts[0])
+        self.assertTrue(accounts[0]["has_cookie"])
         self.assertFalse(any("saved" in key for key in accounts[0]))
 
     def test_saved_sync_is_disabled_and_old_saved_only_records_are_hidden(self):
