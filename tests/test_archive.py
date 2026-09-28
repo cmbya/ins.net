@@ -60,10 +60,11 @@ class FakeGallery:
 
     def scan_posts(self, cookie, url, max_posts=None, cursor=None):
         self.scan_requests.append((url, max_posts, cursor))
+        lookup = url.replace("/id:1234/", "/creator/")
         if max_posts == 20:
-            items = self.posts_by_url.get(url, self.posts_data)
+            items = self.posts_by_url.get(lookup, self.posts_data)
             return list(items[:20]), None
-        return self.history_responses.get((url, cursor), self.history_responses.get(cursor, ([], None)))
+        return self.history_responses.get((lookup, cursor), self.history_responses.get(cursor, ([], None)))
 
     def download(self, cookie, item, staging, media_ids=None):
         self.calls += 1
@@ -146,6 +147,15 @@ class ArchiveTests(unittest.TestCase):
                 gallery.posts(None, "https://www.instagram.com/public/posts/", 20)
         self.assertNotIn("--cookies", run.call_args.args[0])
         self.assertIn("--verbose", run.call_args.args[0])
+
+    def test_gallery_not_found_message_does_not_claim_the_author_is_missing(self):
+        gallery = GalleryDL()
+        data = json.dumps([[-1, {"message": "Requested user could not be found"}]])
+        with patch.object(gallery, "_run", return_value=(data, "[instagram][debug] HTTP 403")):
+            with self.assertRaises(GalleryError) as caught:
+                gallery.posts(None, "https://www.instagram.com/creator/posts/", 20)
+        self.assertIn("HTTP 403", str(caught.exception))
+        self.assertIn("不能证明博主真的不存在", str(caught.exception))
 
     def test_anonymous_download_uses_scanned_media_url_instead_of_permalink(self):
         import io
@@ -252,6 +262,22 @@ class ArchiveTests(unittest.TestCase):
             self.assertEqual(counts["failed"], 1)
             self.assertEqual(fake.attempts, [(None, "FIRST")])
             self.assertEqual(db.creator(account["id"], "creator")["failures"], 1)
+
+    def test_cached_instagram_id_skips_username_lookup_and_checks_owner(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            fake = FakeGallery([post("NEW")])
+            db, account, _, archive = self.setup_service(root, fake)
+            db.add_creator(account["id"], "creator", access_mode="cookie")
+            db.update_creator_profile(account["id"], "creator", profile_id="1234")
+            service = SyncService(db, root, fake, archive_root=archive)
+            counts, _ = service.run(account, "creator", username="creator")
+            self.assertEqual(counts["downloaded"], 1)
+            self.assertIn("/id:1234/posts/", fake.scan_requests[0][0])
+            fake.posts_data = [post("WRONG", username="someone_else")]
+            counts, error = service.run(account, "creator", username="creator")
+            self.assertEqual(counts["failed"], 1)
+            self.assertIn("用户 ID 与博主用户名不匹配", error)
 
     def test_gallery_dl_reels_profile_url_preserves_reel_permalink(self):
         gallery = GalleryDL()
@@ -667,7 +693,9 @@ class ArchiveTests(unittest.TestCase):
             self.assertEqual(state["reels_history_complete"], 0)
             history_calls = [(url, cursor) for url, size, cursor in fake.scan_requests if size == 31]
             self.assertEqual(history_calls, [
-                (grid_url, None), (grid_url, "posts-next"), (reels_url, None),
+                (grid_url.replace("/creator/", "/id:1234/"), None),
+                (grid_url.replace("/creator/", "/id:1234/"), "posts-next"),
+                (reels_url.replace("/creator/", "/id:1234/"), None),
             ])
 
     def test_archive_copies_across_mounts_before_atomic_replace(self):
