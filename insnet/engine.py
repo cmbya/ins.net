@@ -137,8 +137,20 @@ class GalleryDL:
             details = "\n".join(str(item.get("message") or item) for item in errors if isinstance(item, dict))
             status = re.search(r"\b(?:HTTP\s*)?(429|401|403)\b", stderr, re.I)
             diagnostic = f" HTTP {status.group(1)}。" if status else ""
-            raise GalleryError("gallery-dl 提取失败。" + diagnostic + "\n" +
-                               redact_output(details or errors, cookie_path))
+            if not status:
+                if re.search(r"redirect to (?:a )?login page", stderr, re.I):
+                    diagnostic = " Instagram 要求重新登录。"
+                elif re.search(r"challenge page", stderr, re.I):
+                    diagnostic = " Instagram 要求完成账号验证。"
+                elif re.search(r"connection (?:reset|failed)|connectionerror", stderr, re.I):
+                    diagnostic = " 连接 Instagram 失败。"
+                elif re.search(r"timed? ?out|readtimeout", stderr, re.I):
+                    diagnostic = " 请求 Instagram 超时。"
+            detail = redact_output(details or errors, cookie_path)
+            if "Requested user could not be found" in detail:
+                detail += ("\n博主资料读取失败；gallery-dl 会把某些接口异常也报成“用户不存在”，"
+                           "此消息不能证明博主真的不存在。请结合 HTTP 状态、授权状态和扫描方式判断。")
+            raise GalleryError("gallery-dl 提取失败。" + diagnostic + "\n" + detail)
         return messages, stderr
 
     def posts(self, cookie_path, url, max_posts=None):
