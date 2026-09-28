@@ -61,6 +61,7 @@ class WebApiTests(unittest.TestCase):
         self.assertEqual(creators[0]["username"], "nasa")
         self.assertEqual(creators[0]["sync_mode"], "recent20")
         self.assertEqual(creators[0]["sync_types"], ["posts"])
+        self.assertEqual(creators[0]["access_mode"], "anonymous")
         self.assertNotIn("interval_minutes", creators[0])
         self.assertNotIn("max_per_run", creators[0])
 
@@ -88,9 +89,16 @@ class WebApiTests(unittest.TestCase):
         self.request_json("/api/creator", {
             "account": self.account_id, "username": "mixed", "sync_types": ["reels"]})
         self.assertEqual(self.db.creator(self.account_id, "mixed")["sync_types"], "reels")
+        self.request_json("/api/creator", {
+            "account": self.account_id, "username": "mixed", "access_mode": "cookie"})
+        self.assertEqual(self.db.creator(self.account_id, "mixed")["access_mode"], "cookie")
         listed = self.request_json("/api/creators?account=" + self.account_id)[1]
         self.assertEqual(next(row for row in listed if row["username"] == "mixed")["sync_types"],
                          ["reels"])
+        with self.assertRaises(HTTPError) as error:
+            self.request_json("/api/creator", {
+                "account": self.account_id, "username": "mixed", "access_mode": "auto"})
+        self.assertEqual(error.exception.code, 400)
         with self.assertRaises(HTTPError) as error:
             self.request_json("/api/creator", {
                 "account": self.account_id, "username": "mixed", "sync_types": []})
@@ -100,6 +108,25 @@ class WebApiTests(unittest.TestCase):
                 "account": self.account_id, "username": "mixed",
                 "sync_types": ["posts", "posts"]})
         self.assertEqual(error.exception.code, 400)
+
+    def test_public_account_can_be_added_without_cookie(self):
+        code, account = self.request_json("/api/accounts", {
+            "username": "publicowner", "label": "公开内容"})
+        self.assertEqual(code, 201)
+        self.assertEqual(self.db.account(account["id"])["cookie_path"], "")
+        self.request_json("/api/creators", {
+            "account": account["id"], "username": "publiccreator"})
+        with patch.object(self.coordinator.service.gallery, "scan_posts", return_value=([], None)):
+            run_id = self.coordinator.start(account["id"], "creator", "publiccreator")
+            self.assertTrue(run_id)
+            for _ in range(40):
+                if account["id"] not in self.coordinator.active:
+                    break
+                time.sleep(.05)
+        self.request_json("/api/creator", {
+            "account": account["id"], "username": "publiccreator", "access_mode": "cookie"})
+        with self.assertRaisesRegex(ValueError, "Cookie"):
+            self.coordinator.start(account["id"], "creator", "publiccreator")
 
 
     def test_dashboard_records_soft_delete_preserve_files_and_logs(self):
