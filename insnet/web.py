@@ -23,7 +23,7 @@ from .sync import Coordinator, SyncService
 
 
 STATIC = Path(__file__).resolve().parent.parent / "static"
-APP_VERSION = "0.7.8"
+APP_VERSION = "0.7.9"
 
 
 def valid_cookie_file(value):
