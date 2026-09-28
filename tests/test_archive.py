@@ -162,6 +162,18 @@ class ArchiveTests(unittest.TestCase):
             run.assert_not_called()
             self.assertIn("scontent.cdninstagram.com", build.return_value.open.call_args.args[0].full_url)
 
+    def test_anonymous_dash_video_keeps_gallery_dl_audio_merging(self):
+        gallery = GalleryDL()
+        item = post("VIDEO")
+        item["items"][0].update(url="ytdl:https://www.instagram.com/p/VIDEO/1.mp4",
+                                kind="video", extension="mp4")
+        with tempfile.TemporaryDirectory() as directory:
+            with patch.object(gallery, "_run") as run:
+                gallery.download(None, item, directory)
+            self.assertEqual(run.call_args.args[0], None)
+            self.assertIn("--filter", run.call_args.args[1])
+            self.assertEqual(run.call_args.args[1][-1], item["source_url"])
+
     def test_anonymous_mode_waits_for_fresh_urls_without_spending_download_budget(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
@@ -175,10 +187,71 @@ class ArchiveTests(unittest.TestCase):
             self.assertEqual(db.creator(account["id"], "creator")["access_mode"], "anonymous")
             # A queued older item outside the recent page must not be fetched via permalink.
             db.upsert_post(account["id"], post("OLD"), "creator:creator:posts")
-            second, _ = service.run(account, "creator", username="creator")
+            with db.connect() as conn:
+                conn.execute("UPDATE accounts SET enabled=0 WHERE id=?", (account["id"],))
+            second, _ = service.run(db.account(account["id"]), "creator", username="creator")
             self.assertEqual(second["downloaded"], 0)
             self.assertEqual(second["failed"], 0)
             self.assertEqual(fake.calls, 1)
+
+    def test_download_tries_public_then_cookie_only_when_authorization_enabled(self):
+        class FallbackGallery(FakeGallery):
+            def __init__(self):
+                super().__init__([post("ABC123")])
+                self.scan_cookies = []
+                self.download_cookies = []
+
+            def scan_posts(self, cookie, url, max_posts=None, cursor=None):
+                self.scan_cookies.append(cookie)
+                return super().scan_posts(cookie, url, max_posts, cursor)
+
+            def download(self, cookie, item, staging, media_ids=None):
+                self.download_cookies.append(cookie)
+                if cookie is None:
+                    raise GalleryError("HTTP 403")
+                return super().download(cookie, item, staging, media_ids)
+
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            fake = FallbackGallery()
+            db, account, _, archive = self.setup_service(root, fake)
+            db.add_creator(account["id"], "creator", access_mode="cookie")
+            service = SyncService(db, root, fake, archive_root=archive)
+            counts, _ = service.run(account, "creator", username="creator")
+            self.assertEqual(counts["downloaded"], 1)
+            self.assertEqual(fake.scan_cookies, [account["cookie_path"]])
+            self.assertEqual(fake.download_cookies, [None, account["cookie_path"]])
+            with db.connect() as conn:
+                conn.execute("UPDATE accounts SET enabled=0 WHERE id=?", (account["id"],))
+            fake.posts_data = [post("NEW")]
+            fake.posts_data[0]["items"][0]["url"] = "https://scontent.cdninstagram.com/new.jpg"
+            fake.download_cookies.clear()
+            fake.scan_cookies.clear()
+            counts, _ = service.run(db.account(account["id"]), "creator", username="creator")
+            self.assertEqual(counts["failed"], 1)
+            self.assertEqual(fake.scan_cookies, [None])
+            self.assertEqual(fake.download_cookies, [None])
+
+    def test_rate_limit_stops_public_download_without_cookie_retry(self):
+        class LimitedGallery(FakeGallery):
+            def __init__(self):
+                super().__init__([post("FIRST"), post("SECOND")])
+                self.attempts = []
+
+            def download(self, cookie, item, staging, media_ids=None):
+                self.attempts.append((cookie, item["shortcode"]))
+                raise GalleryError("HTTP 429")
+
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            fake = LimitedGallery()
+            db, account, _, archive = self.setup_service(root, fake)
+            db.add_creator(account["id"], "creator", access_mode="cookie")
+            counts, _ = SyncService(db, root, fake, archive_root=archive).run(
+                account, "creator", username="creator")
+            self.assertEqual(counts["failed"], 1)
+            self.assertEqual(fake.attempts, [(None, "FIRST")])
+            self.assertEqual(db.creator(account["id"], "creator")["failures"], 1)
 
     def test_gallery_dl_reels_profile_url_preserves_reel_permalink(self):
         gallery = GalleryDL()
@@ -204,11 +277,11 @@ class ArchiveTests(unittest.TestCase):
             self.assertEqual(archived["status"], "complete")
             self.assertEqual(archived["sources"], ["creator:creator:posts"])
             self.assertTrue(all((archive / item["relative_path"]).is_file() for item in archived["media"]))
-            self.assertEqual(fake.calls, 2)
+            self.assertEqual(fake.calls, 3)
             self.assertTrue(all("/reels/" not in url for url, _, _ in fake.scan_requests))
             counts, error = service.run(account, "creator", username="creator")
             self.assertEqual(counts["skipped"], 1)
-            self.assertEqual(fake.calls, 2)
+            self.assertEqual(fake.calls, 3)
 
     def test_single_image_uses_date_title_folder_and_title_filename(self):
         with tempfile.TemporaryDirectory() as temporary:
