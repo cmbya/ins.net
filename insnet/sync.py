@@ -344,6 +344,17 @@ class SyncService:
         account_id, name = account["id"], creator["username"]
         source = f"creator:{name}:{category}"
         url = f"https://www.instagram.com/{name}/{'posts' if category == 'posts' else 'reels'}/"
+        profile_id = str(creator.get("profile_id") or "")
+        # gallery-dl's id: form goes directly to the feed, bypassing the
+        # username lookup whose broad exception handler can report a real
+        # request failure as "Requested user could not be found".
+        scan_url = (f"https://www.instagram.com/id:{profile_id}/"
+                    f"{'posts' if category == 'posts' else 'reels'}/") if (
+                        profile_id.isdecimal() and len(profile_id) <= 24) else url
+        if scan_url != url:
+            self._log(log, "INFO", source,
+                      f"已保存 @{name} 的 Instagram 用户 ID；直接扫描作品接口，"
+                      "省去可能报“用户不存在”的用户名查询")
         mode = creator["sync_mode"]
         content_label = "帖子网格" if category == "posts" else "Reels"
         verify_cursor_key = "verify_cursor" if category == "posts" else "reels_verify_cursor"
@@ -420,7 +431,15 @@ class SyncService:
 
         if not all_history:
             # Keep recent-only mode bounded to the requested 20 posts.
-            recent, _ = self._scan(account, url, 20)
+            try:
+                recent, _ = self._scan(account, scan_url, 20)
+                if any(item["username"].lower() != name.lower() for item in recent):
+                    raise GalleryError("缓存的 Instagram 用户 ID 与博主用户名不匹配；已停止扫描以免归档错误账号")
+            except GalleryError:
+                self._log(log, "WARNING", source,
+                          "作品列表尚未读取成功（0 条）；本轮没有进入媒体下载，"
+                          "“下载失败后用 Cookie 重试”不会触发。可在博主列表选择使用 Cookie 扫描后重试")
+                raise
             self._persist_scan(account, recent, source, name)
             recent_count = len(recent)
             raw_scanned = len(recent)
@@ -468,7 +487,9 @@ class SyncService:
                     break
                 requested_cursors.add(cursor)
                 try:
-                    page, next_cursor = self._scan(account, url, page_limit, cursor=cursor)
+                    page, next_cursor = self._scan(account, scan_url, page_limit, cursor=cursor)
+                    if any(item["username"].lower() != name.lower() for item in page):
+                        raise GalleryError("缓存的 Instagram 用户 ID 与博主用户名不匹配；已停止扫描以免归档错误账号")
                 except Exception as exc:
                     scan_error = str(exc)
                     break
@@ -550,6 +571,11 @@ class SyncService:
                               f"匿名模式暂留 {unscanned} 条旧队列作品：本轮未扫描到媒体地址，后续完整历史扫描继续处理")
             if scan_error:
                 self._log(log, "ERROR", source, f"全历史分页未能确认完成：{scan_error}")
+                if page_number == 0:
+                    self._log(log, "WARNING", source,
+                              "第 1 页读取失败，本轮没有进入媒体下载；下载 Cookie 回退不会触发。"
+                              "如需尝试授权扫描，请在博主列表选择“扫描作品时：使用 Cookie”并保存；"
+                              "若授权检测也失败，请先排查 Cookie 或暂缓请求")
                 result["failed"] += 1
                 result["error"] = scan_error
 
