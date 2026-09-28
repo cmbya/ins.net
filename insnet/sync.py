@@ -769,26 +769,61 @@ class Coordinator:
             label = f"@{username}" if kind == "creator" else "授权检测"
             log("INFO", kind, f"任务开始：账号 @{account['username']}，来源 {label}")
             if kind == 'check':
-                self.service.gallery.posts(account['cookie_path'], f"https://www.instagram.com/{account['username']}/posts/", 1)
+                profile_id = self._cookie_profile_id(account['cookie_path'])
+                if profile_id:
+                    log('INFO', 'authorization', 'Cookie 包含账号数字 ID；跳过用户名资料查询，直接检测帖子接口')
+                else:
+                    log('WARNING', 'authorization', 'Cookie 未提供账号数字 ID；检测仍需查询用户名，失败时可能无法判断 Cookie 状态')
+                profile = f"id:{profile_id}" if profile_id else account['username']
+                self.service.gallery.posts(account['cookie_path'], f"https://www.instagram.com/{profile}/posts/", 1)
                 message = ''
-                log('INFO', 'authorization', '已成功访问 Instagram 帖子接口；未下载媒体')
+                log('INFO', 'authorization', '帖子接口可访问；这不能单独证明 Cookie 有效（公开访问也可能成功）；未下载媒体')
             else:
                 counts, message = self.service.run(account, kind, log, username)
             status = "partial" if counts["failed"] else "complete"
             self.db.finish_run(run_id, status, counts, message)
             if kind == "check":
                 with self.db.connect() as conn:
-                    conn.execute("UPDATE accounts SET cookie_status='ok',cookie_checked_at=CURRENT_TIMESTAMP WHERE id=?", (account["id"],))
+                    conn.execute("UPDATE accounts SET cookie_status='reachable',cookie_checked_at=CURRENT_TIMESTAMP WHERE id=?", (account["id"],))
         except Exception as exc:
             message = f"{type(exc).__name__}: {exc}"
             log("ERROR", kind, f"任务异常：{message}")
             if kind == "check":
+                expired = isinstance(exc, ValueError) and str(exc) == 'Cookie 中的 sessionid 已过期'
+                if not expired:
+                    log('WARNING', 'authorization',
+                        '帖子接口访问失败，Cookie 是否有效尚无法判定；登录跳转、网络限制或接口限流都可能导致失败。'
+                        '请暂停重复请求，先在浏览器确认该账号能访问 Instagram，再检查 Cookie 导出时间和容器网络。')
                 with self.db.connect() as c:
-                    c.execute("UPDATE accounts SET cookie_status='error',cookie_checked_at=CURRENT_TIMESTAMP WHERE id=?",(account['id'],))
+                    c.execute("UPDATE accounts SET cookie_status=?,cookie_checked_at=CURRENT_TIMESTAMP WHERE id=?",
+                              ('expired' if expired else 'unknown', account['id']))
             self.db.finish_run(run_id, "failed", counts, message)
         finally:
             with self.lock:
                 self.active.discard(account["id"])
+
+    @staticmethod
+    def _cookie_profile_id(cookie_path):
+        """Use the optional account ID without exposing cookie values in logs."""
+        profile_id = None
+        session_seen = False
+        for line in Path(cookie_path).read_text(encoding='utf-8', errors='replace').splitlines():
+            fields = line.removeprefix('#HttpOnly_').split('\t')
+            if len(fields) < 7 or fields[0].lstrip('.').lower() != 'instagram.com':
+                continue
+            if fields[5] == 'sessionid' and fields[6]:
+                session_seen = True
+                try:
+                    expiry = int(fields[4])
+                except ValueError:
+                    expiry = 0
+                if expiry > 0 and expiry <= time.time():
+                    raise ValueError('Cookie 中的 sessionid 已过期')
+            if fields[5] == 'ds_user_id' and re.fullmatch(r'[0-9]{1,30}', fields[6]):
+                profile_id = fields[6]
+        if not session_seen:
+            raise ValueError('Cookie 文件缺少 Instagram sessionid')
+        return profile_id
 
     def schedule(self):
         def record_error(message):
