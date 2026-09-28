@@ -276,6 +276,12 @@ class SyncService:
                 if processed is not None:
                     processed[shortcode]["outcome"] = "本地媒体完整，跳过"
                 continue
+            if not account["cookie_path"] and not all(item.get("url") for item in post.get("items", [])):
+                if processed is not None:
+                    processed.pop(shortcode, None)
+                self._log(log, "INFO", source,
+                          f"暂缓 {shortcode}：匿名模式需要本轮扫描取得媒体地址；完整历史扫描可重新找到旧作品")
+                continue
             if (shared_budget is not None and shared_budget["remaining"] <= 0) or (
                     max_per_run is not None and attempts >= max_per_run):
                 if processed is not None:
@@ -396,7 +402,7 @@ class SyncService:
             raw_scanned = len(recent)
             self._log(log, "INFO", source,
                       f"最新内容读取完成：{len(recent)} 条{content_label}作品")
-            candidates = dict(backlog_by_shortcode)
+            candidates = dict(backlog_by_shortcode) if account["cookie_path"] else {}
             seen = set()
             for post in recent:
                 shortcode = post["shortcode"]
@@ -407,6 +413,8 @@ class SyncService:
                 scanned_shortcodes.add(shortcode)
                 if shortcode in backlog_by_shortcode:
                     overlap_with_backlog += 1
+                    if not account["cookie_path"]:
+                        candidates[shortcode] = {**post, "queued_before_run": True}
                     continue
                 candidates[shortcode] = {**post, "queued_before_run": False}
             process_batch(list(candidates.values()))
@@ -450,7 +458,7 @@ class SyncService:
                     history_count += len(page)
 
                 page_candidates = []
-                if page_number == 1:
+                if page_number == 1 and account["cookie_path"]:
                     page_candidates.extend(backlog_by_shortcode.values())
                     backlog_processed = True
                 new_on_page = 0
@@ -463,6 +471,8 @@ class SyncService:
                     scanned_shortcodes.add(shortcode)
                     if shortcode in backlog_by_shortcode:
                         overlap_with_backlog += 1
+                        if not account["cookie_path"]:
+                            page_candidates.append({**post, "queued_before_run": True})
                         continue
                     page_candidates.append({**post, "queued_before_run": False})
                     new_on_page += 1
@@ -505,8 +515,13 @@ class SyncService:
                 cursor = next_cursor
                 self._pause_history_scan()
 
-            if not backlog_processed:
+            if not backlog_processed and account["cookie_path"]:
                 process_batch(list(backlog_by_shortcode.values()))
+            if not account["cookie_path"]:
+                unscanned = len(set(backlog_by_shortcode) - scanned_shortcodes)
+                if unscanned:
+                    self._log(log, "INFO", source,
+                              f"匿名模式暂留 {unscanned} 条旧队列作品：本轮未扫描到媒体地址，后续完整历史扫描继续处理")
             if scan_error:
                 self._log(log, "ERROR", source, f"全历史分页未能确认完成：{scan_error}")
                 result["failed"] += 1
@@ -612,7 +627,11 @@ class SyncService:
                        for category in self.db._parse_sync_types(creator.get("sync_types", "posts"))]
             source = sources[0]
             try:
-                counts = self._run_creator(account, creator, log)
+                access_mode = creator.get("access_mode", "cookie")
+                self._log(log, "INFO", source,
+                          f"访问方式：{'公开访问（不使用 Cookie）' if access_mode == 'anonymous' else '账号 Cookie'}")
+                selected_account = {**account, "cookie_path": None} if access_mode == "anonymous" else account
+                counts = self._run_creator(selected_account, creator, log)
                 if counts["failed"]:
                     errors = [message for item_source in sources
                               for message in self.db.source_errors(account["id"], item_source)]
@@ -648,14 +667,16 @@ class Coordinator:
         account = self.db.account(account_id)
         if not account:
             raise ValueError("账号不存在")
-        if not account.get("cookie_path"):
-            raise ValueError("账号尚未配置 Cookie，请先更新授权")
         if kind != "check" and not account.get("enabled", 1):
             raise ValueError("账号同步已暂停，请先启用")
+        if kind == "check" and not account.get("cookie_path"):
+            raise ValueError("尚未配置 Cookie，无法进行授权检测")
         if kind == "creator":
             creator = self.db.creator(account_id, username or "")
             if not creator or int(creator.get("manual", 0)) != 1:
                 raise ValueError("博主不存在或已移出监控列表")
+            if creator.get("access_mode", "cookie") == "cookie" and not account.get("cookie_path"):
+                raise ValueError("该博主使用账号 Cookie，请先更新授权或切换为公开访问")
         with self.lock:
             if account_id in self.active:
                 raise ValueError("该账号有任务正在运行")
