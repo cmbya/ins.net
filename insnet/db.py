@@ -15,6 +15,7 @@ CREATE TABLE IF NOT EXISTS creators (
     last_sync TEXT, display_name TEXT NOT NULL DEFAULT '', avatar_url TEXT NOT NULL DEFAULT '',
     profile_id TEXT NOT NULL DEFAULT '', sync_mode TEXT NOT NULL DEFAULT 'recent20',
     sync_types TEXT NOT NULL DEFAULT 'posts', sync_turn TEXT NOT NULL DEFAULT 'posts',
+    access_mode TEXT NOT NULL DEFAULT 'cookie',
     interval_minutes INTEGER NOT NULL DEFAULT 360, max_per_run INTEGER NOT NULL DEFAULT 20,
     scan_cursor TEXT, history_complete INTEGER NOT NULL DEFAULT 0,
     reels_scan_cursor TEXT, reels_history_complete INTEGER NOT NULL DEFAULT 0,
@@ -76,6 +77,7 @@ class Database:
         "sync_mode": "TEXT NOT NULL DEFAULT 'recent20'",
         "sync_types": "TEXT NOT NULL DEFAULT 'posts'",
         "sync_turn": "TEXT NOT NULL DEFAULT 'posts'",
+        "access_mode": "TEXT NOT NULL DEFAULT 'cookie'",
         "interval_minutes": "INTEGER NOT NULL DEFAULT 360",
         "max_per_run": "INTEGER NOT NULL DEFAULT 20",
         "scan_cursor": "TEXT",
@@ -198,7 +200,9 @@ class Database:
                             (account_id, username)).fetchone()
             return dict(row) if row else None
 
-    def add_creator(self, account_id, username, sync_types=None):
+    def add_creator(self, account_id, username, sync_types=None, access_mode="cookie"):
+        if access_mode not in ("anonymous", "cookie"):
+            raise ValueError("访问方式无效")
         interval = int(self.setting("creator_interval", "360"))
         maximum = int(self.setting("creator_max", "20"))
         selected = self._parse_sync_types(",".join(sync_types) if isinstance(sync_types, (list, tuple))
@@ -206,19 +210,22 @@ class Database:
         sync_types_value = ",".join(sorted(selected))
         sync_turn = "posts" if "posts" in selected else "reels"
         with self.connect() as c:
-            c.execute("""INSERT INTO creators(account_id,username,manual,enabled,next_sync_at,interval_minutes,max_per_run,sync_types,sync_turn)
-                         VALUES(?,?,1,1,CURRENT_TIMESTAMP,?,?,?,?)
+            c.execute("""INSERT INTO creators(account_id,username,manual,enabled,next_sync_at,interval_minutes,max_per_run,sync_types,sync_turn,access_mode)
+                         VALUES(?,?,1,1,CURRENT_TIMESTAMP,?,?,?,?,?)
                          ON CONFLICT(account_id,username) DO UPDATE SET manual=1,enabled=1,
                          interval_minutes=excluded.interval_minutes,max_per_run=excluded.max_per_run,
-                         sync_types=excluded.sync_types,
+                         sync_types=excluded.sync_types,access_mode=excluded.access_mode,
                          sync_turn=CASE WHEN instr(excluded.sync_types,creators.sync_turn)=0
                                         THEN excluded.sync_turn ELSE creators.sync_turn END,
                          next_sync_at=CURRENT_TIMESTAMP""",
-                      (account_id, username, interval, maximum, sync_types_value, sync_turn))
+                      (account_id, username, interval, maximum, sync_types_value, sync_turn, access_mode))
 
-    def set_creator(self, account_id, username, *, enabled=None, sync_mode=None, sync_types=None):
+    def set_creator(self, account_id, username, *, enabled=None, sync_mode=None, sync_types=None,
+                    access_mode=None):
+        if access_mode is not None and access_mode not in ("anonymous", "cookie"):
+            raise ValueError("访问方式无效")
         fields, values = [], []
-        for field, value in (("enabled", enabled), ("sync_mode", sync_mode)):
+        for field, value in (("enabled", enabled), ("sync_mode", sync_mode), ("access_mode", access_mode)):
             if value is not None:
                 fields.append(f"{field}=?")
                 values.append(int(value) if field == "enabled" else value)
@@ -231,7 +238,7 @@ class Database:
             values.extend((sync_types_value, sync_types_value, sync_turn))
         if enabled is True:
             fields.append("next_sync_at=CURRENT_TIMESTAMP")
-        if sync_types is not None:
+        if sync_types is not None or access_mode is not None:
             fields.append("next_sync_at=CURRENT_TIMESTAMP")
         if not fields:
             return False
