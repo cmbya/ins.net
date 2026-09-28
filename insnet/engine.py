@@ -4,8 +4,12 @@ import hashlib
 import json
 import re
 import subprocess
+import shutil
 from collections import OrderedDict
 from pathlib import Path
+from urllib.error import HTTPError
+from urllib.parse import urlsplit
+from urllib.request import HTTPRedirectHandler, Request, build_opener
 
 
 USERNAME = re.compile(r"^[A-Za-z0-9._]{1,30}$")
@@ -24,7 +28,7 @@ def redact_output(value, cookie_path):
     else:
         text = value.decode("utf-8", "replace") if isinstance(value, bytes) else str(value or "")
     try:
-        for line in Path(cookie_path).read_text(encoding="utf-8", errors="replace").splitlines():
+        for line in Path(cookie_path).read_text(encoding="utf-8", errors="replace").splitlines() if cookie_path else ():
             fields = line.removeprefix("#HttpOnly_").split("\t")
             # Cookie jars also contain short values such as "1" and "en".
             # Replacing those substrings corrupts useful URLs and diagnostics.
@@ -86,7 +90,7 @@ def normalize_messages(messages, category="posts"):
             continue
         group["items"].append({
             "media_id": media_id, "position": len(group["items"]) + 1,
-            "kind": kind, "extension": extension,
+            "kind": kind, "extension": extension, "url": media_url,
         })
     return list(groups.values())
 
@@ -96,8 +100,10 @@ class GalleryDL:
         self.executable, self.timeout = executable, timeout
 
     def _run(self, cookie_path, args, with_stderr=False):
-        command = [self.executable, "--config-ignore", "--no-input", "--cookies",
-                   str(cookie_path), *args]
+        command = [self.executable, "--config-ignore", "--no-input"]
+        if cookie_path:
+            command += ["--cookies", str(cookie_path)]
+        command += args
         try:
             result = subprocess.run(command, capture_output=True, text=True,
                                     timeout=self.timeout, check=False)
@@ -129,11 +135,14 @@ class GalleryDL:
         errors = [msg[-1] for msg in messages if isinstance(msg, list) and msg and msg[0] == -1]
         if errors:
             details = "\n".join(str(item.get("message") or item) for item in errors if isinstance(item, dict))
-            raise GalleryError("gallery-dl 提取失败。\n" + redact_output(details or errors, cookie_path))
+            status = re.search(r"\b(?:HTTP\s*)?(429|401|403)\b", stderr, re.I)
+            diagnostic = f" HTTP {status.group(1)}。" if status else ""
+            raise GalleryError("gallery-dl 提取失败。" + diagnostic + "\n" +
+                               redact_output(details or errors, cookie_path))
         return messages, stderr
 
     def posts(self, cookie_path, url, max_posts=None):
-        messages, _ = self._json(cookie_path, url, max_posts)
+        messages, _ = self._json(cookie_path, url, max_posts, verbose=True)
         category = "reels" if re.search(r"/reels/?$", url) else "posts"
         return normalize_messages(messages, category)
 
@@ -148,6 +157,35 @@ class GalleryDL:
     def download(self, cookie_path, post, staging, media_ids=None):
         staging = Path(staging)
         staging.mkdir(parents=True, exist_ok=True)
+        if not cookie_path:
+            selected = set(media_ids or (item["media_id"] for item in post["items"]))
+            for item in post["items"]:
+                if item["media_id"] not in selected:
+                    continue
+                media_url = item.get("url", "")
+                if not media_url:
+                    raise GalleryError("匿名模式缺少本轮扫描的媒体地址；需重新扫描该作品或改用账号 Cookie")
+                target = staging / f"{item['media_id']}.{item['extension']}"
+                direct_url = media_url.removeprefix("ytdl:")
+                self._validate_media_url(direct_url)
+                try:
+                    if media_url.startswith("ytdl:"):
+                        command = ["yt-dlp", "--ignore-config", "--no-playlist", "--no-part",
+                                   "--no-progress", "-o", str(target), direct_url]
+                        result = subprocess.run(command, capture_output=True, text=True,
+                                                timeout=self.timeout, check=False)
+                        if result.returncode:
+                            raise GalleryError(f"匿名视频下载失败（yt-dlp 退出码 {result.returncode}）")
+                    else:
+                        opener = build_opener(self._SafeMediaRedirect())
+                        with opener.open(Request(direct_url, headers={"User-Agent": "Mozilla/5.0"}),
+                                         timeout=120) as response, target.open("wb") as output:
+                            shutil.copyfileobj(response, output)
+                except HTTPError as exc:
+                    raise GalleryError(f"匿名媒体下载失败：HTTP {exc.code}") from exc
+                except (OSError, TimeoutError) as exc:
+                    raise GalleryError(f"匿名媒体下载失败：{type(exc).__name__}") from exc
+            return {p.stem: p for p in staging.iterdir() if p.is_file() and p.stat().st_size > 0}
         args = ["--no-mtime", "-D", str(staging), "-f",
                 "{media_id}.{extension}", post["source_url"]]
         if media_ids:
@@ -156,3 +194,18 @@ class GalleryDL:
             args[0:0] = ["--filter", f"media_id in {tuple(media_ids)!r}"]
         self._run(cookie_path, args)
         return {p.stem: p for p in staging.iterdir() if p.is_file() and p.stat().st_size > 0}
+
+    @staticmethod
+    def _validate_media_url(url):
+        parsed = urlsplit(url)
+        host = parsed.hostname or ""
+        if parsed.scheme != "https" or parsed.username or parsed.password or parsed.port not in (None, 443) or not (
+                                            host.endswith(".cdninstagram.com") or
+                                            host.endswith(".fbcdn.net") or
+                                            host in ("cdninstagram.com", "fbcdn.net")):
+            raise GalleryError("匿名模式只允许下载 Instagram 的 HTTPS 媒体地址")
+
+    class _SafeMediaRedirect(HTTPRedirectHandler):
+        def redirect_request(self, req, fp, code, msg, headers, newurl):
+            GalleryDL._validate_media_url(newurl)
+            return super().redirect_request(req, fp, code, msg, headers, newurl)
