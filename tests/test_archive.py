@@ -8,7 +8,7 @@ from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import patch
 
-from insnet.db import Database
+from insnet.db import Database, SCHEMA
 from insnet.entrypoint import _check_archive_access
 from insnet.engine import GalleryDL, GalleryError, normalize_messages, redact_output
 from insnet.sync import Coordinator, SyncService
@@ -102,6 +102,7 @@ class ArchiveTests(unittest.TestCase):
     def test_gallery_messages_keep_carousel_and_creator_profile(self):
         posts = normalize_messages(MESSAGES)
         self.assertEqual([x["kind"] for x in posts[0]["items"]], ["image", "video"])
+        self.assertEqual(posts[0]["items"][0]["url"], "https://cdn.example/a.jpg")
         self.assertEqual(posts[0]["shortcode"], "ABC123")
         self.assertEqual(posts[0]["display_name"], "Creator Name")
         self.assertEqual(posts[0]["avatar_url"], "https://cdn.example/avatar.jpg")
@@ -135,6 +136,49 @@ class ArchiveTests(unittest.TestCase):
             items = gallery.posts("cookies.txt", "https://www.instagram.com/owner/posts/")
         self.assertEqual(len(items), 1)
         self.assertEqual(items[0]["shortcode"], "ABC123")
+
+    def test_anonymous_scan_omits_cookie_option_and_reports_rate_limit(self):
+        gallery = GalleryDL()
+        with patch("insnet.engine.subprocess.run", return_value=SimpleNamespace(
+                returncode=0, stdout=json.dumps([[-1, {"message": "Requested user could not be found"}]]),
+                stderr="[instagram][debug] HTTP Error 429")) as run:
+            with self.assertRaisesRegex(GalleryError, "HTTP 429"):
+                gallery.posts(None, "https://www.instagram.com/public/posts/", 20)
+        self.assertNotIn("--cookies", run.call_args.args[0])
+        self.assertIn("--verbose", run.call_args.args[0])
+
+    def test_anonymous_download_uses_scanned_media_url_instead_of_permalink(self):
+        import io
+        from contextlib import closing
+        gallery = GalleryDL()
+        item = post("ABC123")
+        item["items"][0]["url"] = "https://scontent.cdninstagram.com/image.jpg"
+        with tempfile.TemporaryDirectory() as directory:
+            with patch("insnet.engine.build_opener") as build, patch.object(gallery, "_run") as run:
+                response = closing(io.BytesIO(b"image data"))
+                build.return_value.open.return_value = response
+                files = gallery.download(None, item, directory)
+            self.assertEqual(files["ABC123-1"].read_bytes(), b"image data")
+            run.assert_not_called()
+            self.assertIn("scontent.cdninstagram.com", build.return_value.open.call_args.args[0].full_url)
+
+    def test_anonymous_mode_waits_for_fresh_urls_without_spending_download_budget(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            fake = FakeGallery([post("ABC123")])
+            fake.posts_data[0]["items"][0]["url"] = "https://scontent.cdninstagram.com/a.jpg"
+            db, account, _, archive = self.setup_service(root, fake)
+            db.add_creator(account["id"], "creator", access_mode="anonymous")
+            service = SyncService(db, root, fake, archive_root=archive)
+            first, _ = service.run(account, "creator", username="creator")
+            self.assertEqual(first["downloaded"], 1)
+            self.assertEqual(db.creator(account["id"], "creator")["access_mode"], "anonymous")
+            # A queued older item outside the recent page must not be fetched via permalink.
+            db.upsert_post(account["id"], post("OLD"), "creator:creator:posts")
+            second, _ = service.run(account, "creator", username="creator")
+            self.assertEqual(second["downloaded"], 0)
+            self.assertEqual(second["failed"], 0)
+            self.assertEqual(fake.calls, 1)
 
     def test_gallery_dl_reels_profile_url_preserves_reel_permalink(self):
         gallery = GalleryDL()
@@ -754,6 +798,15 @@ class ArchiveTests(unittest.TestCase):
             self.assertEqual(creator["last_error"], "HTTP 429")
             self.assertFalse(db.due_creators(account_id))
             self.assertEqual(db.admin_config()["creator_interval"], 30)
+
+    def test_existing_creator_migrates_to_cookie_mode(self):
+        with tempfile.TemporaryDirectory() as directory:
+            database = Path(directory) / "insnet.sqlite3"
+            with sqlite3.connect(database) as conn:
+                conn.executescript(SCHEMA.replace("    access_mode TEXT NOT NULL DEFAULT 'cookie',\n", ""))
+                conn.execute("INSERT INTO creators(account_id,username) VALUES('owner','existing')")
+            db = Database(directory)
+            self.assertEqual(db.creator("owner", "existing")["access_mode"], "cookie")
 
     def test_failure_log_contains_diagnostics_and_redacts_cookie(self):
         with tempfile.TemporaryDirectory() as temporary:
