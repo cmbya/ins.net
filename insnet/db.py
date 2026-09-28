@@ -598,7 +598,8 @@ class Database:
         legacy = {"cookie_path", "saved_subdir", "saved_max_per_run", "saved_recent_only",
                   "auto_saved", "saved_interval_minutes", "saved_next_sync_at",
                   "saved_last_sync", "saved_failures"}
-        return [{k:v for k,v in a.items() if k not in legacy} for a in self.accounts()]
+        return [{**{k:v for k,v in a.items() if k not in legacy},
+                 "has_cookie": bool(a["cookie_path"])} for a in self.accounts()]
 
     def admin_config(self):
         defaults = {"creator_interval":"360","creator_max":"20","scheduler_enabled":"1","log_days":"30"}
