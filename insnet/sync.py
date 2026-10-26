@@ -707,6 +707,10 @@ class SyncService:
                 self._log(log, "ERROR", source, f"同步博主失败：{exc}")
             finally:
                 self.db.mark_creator_sync(account["id"], creator["username"], error, rate_limited)
+                if rate_limited:
+                    until = self.db.mark_account_limited(account['id'])
+                    self._log(log, 'WARNING', source,
+                              f'HTTP 429：账号全部任务冷却至 {until} UTC；不尝试切换Cookie或内容类型。')
         else:
             raise ValueError("未知同步任务")
         self._log(log, "INFO", kind,
@@ -728,6 +732,9 @@ class Coordinator:
         account = self.db.account(account_id)
         if not account:
             raise ValueError("账号不存在")
+        cooldown = self.db.account_cooldown(account_id)
+        if cooldown:
+            raise ValueError(f"账号处于 HTTP 429 冷却，截止 {cooldown} UTC；自动、手动和授权检测均暂停")
         if kind == "check":
             if not account.get("enabled", 1):
                 raise ValueError("当前禁止使用 Cookie，请先启用后再检测")
@@ -768,6 +775,7 @@ class Coordinator:
         try:
             label = f"@{username}" if kind == "creator" else "授权检测"
             log("INFO", kind, f"任务开始：账号 @{account['username']}，来源 {label}")
+            log('INFO', kind, '采集策略：Instagram单HTTP请求重试=0，请求间隔3秒；429后账号统一冷却24小时。此间隔不保证不受限。')
             if kind == 'check':
                 profile_id = self._cookie_profile_id(account['cookie_path'])
                 if profile_id:
@@ -788,6 +796,9 @@ class Coordinator:
         except Exception as exc:
             message = f"{type(exc).__name__}: {exc}"
             log("ERROR", kind, f"任务异常：{message}")
+            if re.search(r'\b429\b|too many requests|rate.?limit', str(exc), re.I):
+                until = self.db.mark_account_limited(account['id'])
+                log('WARNING', kind, f'HTTP 429：账号全部任务冷却至 {until} UTC')
             if kind == "check":
                 expired = isinstance(exc, ValueError) and str(exc) == 'Cookie 中的 sessionid 已过期'
                 if not expired:

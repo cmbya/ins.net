@@ -95,6 +95,7 @@ class Database:
         "enabled": "INTEGER NOT NULL DEFAULT 1",
         "cookie_status": "TEXT NOT NULL DEFAULT 'unverified'",
         "cookie_checked_at": "TEXT",
+        "cooldown_until": "TEXT",
         "creator_subdir": "TEXT NOT NULL DEFAULT ''",
     }
 
@@ -292,7 +293,20 @@ class Database:
                          next_sync_at=datetime('now','+'||?||' minutes') WHERE account_id=? AND username=?""",
                       (error[:1000], failures, delay, account_id, username))
 
+    def account_cooldown(self, account_id):
+        with self.connect() as c:
+            row = c.execute("SELECT cooldown_until FROM accounts WHERE id=? AND cooldown_until>CURRENT_TIMESTAMP", (account_id,)).fetchone()
+            return row['cooldown_until'] if row else None
+
+    def mark_account_limited(self, account_id):
+        # Persist across container restarts; never shorten an existing deadline.
+        with self.connect() as c:
+            c.execute("""UPDATE accounts SET cooldown_until=MAX(COALESCE(cooldown_until,''),datetime('now','+24 hours')) WHERE id=?""", (account_id,))
+        return self.account_cooldown(account_id)
+
     def due_creators(self, account_id):
+        if self.account_cooldown(account_id):
+            return None
         with self.connect() as c:
             row = c.execute("""SELECT * FROM creators WHERE account_id=? AND manual=1 AND enabled=1
                          AND (next_sync_at IS NULL OR next_sync_at<=CURRENT_TIMESTAMP)

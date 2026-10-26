@@ -5,6 +5,7 @@ import json
 import re
 import subprocess
 import shutil
+import time
 from collections import OrderedDict
 from pathlib import Path
 from urllib.error import HTTPError
@@ -100,7 +101,10 @@ class GalleryDL:
         self.executable, self.timeout = executable, timeout
 
     def _run(self, cookie_path, args, with_stderr=False):
-        command = [self.executable, "--config-ignore", "--no-input"]
+        command = [self.executable, "--config-ignore", "--no-input",
+                   "-o", "extractor.instagram.retries=0",
+                   "-o", "extractor.instagram.sleep-request=3.0"]
+        started = time.monotonic()
         if cookie_path:
             command += ["--cookies", str(cookie_path)]
         command += args
@@ -114,8 +118,11 @@ class GalleryDL:
             raise GalleryError(f"无法启动 gallery-dl：{exc}") from exc
         if result.returncode:
             detail = redact_output((result.stderr, result.stdout), cookie_path)
-            raise GalleryError(f"gallery-dl 退出码 {result.returncode}。\n{detail or '程序未输出错误详情。'}")
-        return (result.stdout, result.stderr) if with_stderr else result.stdout
+            elapsed = time.monotonic() - started
+            raise GalleryError(f"gallery-dl 退出码 {result.returncode}；耗时{elapsed:.1f}秒，Instagram单HTTP请求重试=0。\n{detail or '程序未输出错误详情。'}")
+        elapsed = time.monotonic() - started
+        diagnostic = f'\n[ins.net] gallery-dl运行{elapsed:.1f}秒；Instagram单HTTP请求重试=0，请求间隔=3秒；HTTP 429交由账号冷却处理。'
+        return (result.stdout, result.stderr + diagnostic) if with_stderr else result.stdout
 
     def _json(self, cookie_path, url, max_posts=None, cursor=None, verbose=False):
         args = ["-j"]
@@ -150,7 +157,8 @@ class GalleryDL:
             if "Requested user could not be found" in detail:
                 detail += ("\n博主资料读取失败；gallery-dl 会把某些接口异常也报成“用户不存在”，"
                            "此消息不能证明博主真的不存在。请结合 HTTP 状态、授权状态和扫描方式判断。")
-            raise GalleryError("gallery-dl 提取失败。" + diagnostic + "\n" + detail)
+            policy = next((line for line in stderr.splitlines() if line.startswith('[ins.net]')), '')
+            raise GalleryError("gallery-dl 提取失败。" + diagnostic + "\n" + detail + '\n' + policy)
         return messages, stderr
 
     def posts(self, cookie_path, url, max_posts=None):
